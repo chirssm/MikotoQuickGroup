@@ -19,6 +19,31 @@
 | **v1.6** | 「**现在点了分组都没有反应了**」（比 v1.4 还糟：v1.4 至少弹报告，v1.5 什么都不出） | **① 点击后立刻在屏幕上画一条「已响应」提示（HUD），从此不可能再「没反应」；② 报告页/对话框全部改用独立 `UIWindow`（不再依赖 `presentViewController:`，消除静默失败）；③ 把 v1.5 新加的「微信全局服务链」从点击路径移出，默认关闭，只在长按菜单里显式开启；④ 单例探测加「返回类型必须是对象」校验（否则非对象返回值当 id 用会 SIGSEGV，`@try` 拦不住）；⑤ 新增会话 ID 来源「单条消息对象」；⑥ 长按菜单新增「自检」** |
 | **v1.7** | 「**点分组弹出：分组出现异常 / Property Name should be baseRequest**」（微信本体抛的异常，MikotoHelper 里没有这个串） | **① 全链路「阶段追踪」：异常弹窗直接写「死在哪个阶段」；② 异常摘要 = 阶段 + 异常自己的调用栈 + 当前线程调用栈 + 最近 30 行日志，一次性复制到剪贴板；③ 识别链 / provider 查找 / 写入流程各自再包一层 `@try`；④ 新增「通用 setter 捕获」——把聊天窗口类（止于 UIViewController）所有对象型 setter 都挂上** |
 | **v1.8** | 「**这一次微信都闪退了**」（v1.7 引入，`@try` 拦不住的进程级崩溃） | **紧急回退 + 加固：① 永久移除「通用 setter 捕获」——它会经 `%hook UIViewController`（全局 hook）把父类链上所有对象型 setter 全替换，含 `setView:` / `setTitle:` / `setDelegate:` 等 UIKit 热方法；② 永久禁用 `PJQGHookSettersEarly`——启动后 1.5s 在主线程遍历全 App 类并装最多 60×160 个 hook，主线程阻塞被 iOS watchdog 杀进程；③ hook 回调去掉成员变量挖掘（不再踩野指针），并加重入保护；④ 每个类只挂钩一次（`gPJQGHookedClasses`）；⑤ 彻底清除所有 `respondsToSelector:`——它会触发微信 protobuf 基类的 `+initialize` 并抛异常；⑥ 保留 v1.7 的阶段追踪与异常调用栈自诊断** |
+| **v1.9** | 「**换个角度：走 Mikoto 自己的路径**」——用户截图证实 MikotoHelper 自带完整链路：聊天框底部「Mikoto」→「Misaka 用户设置」→「分组名称」→ 选分组，且**「用户设置」页上直接显示着「当前会话 ID」** | **① 新增最权威的会话 ID 来源（识别链 ⓪ 级）：`PJMisakaManager.settingVC.m_nsUsrName` —— MikotoHelper 自己认定的那个，不用再猜微信字段；② 新增「打开 Mikoto 分组列表（实验）」：直接复用它的 `PJMisakaSettingViewController` 与 `misaka_selectGroupAction` / `groupSettingFriendGroupIDAction` 等动作，把它自己的分组列表调出来，选完由它自己完成写入；③ 新增「探测 Mikoto 分组接口」：只读打印关键 selector 的实现者+完整签名、9 个目标类的运行时方法表、`PJMisakaManager` 实例的全部成员变量取值 —— 一键复制发回；④ 全部为只读 + 显式点击触发 + 危险调用哨兵** |
+
+### v1.9 的 4 项改动（本次重点）
+
+**依据 —— 用户真机截图（4 张）确认的三件事：**
+
+1. 聊天输入框上方工具栏里，**Mikoto 插件已经有一个「Mikoto」按钮**（快捷回复 / **Mikoto** / 收藏 / 照片 / 拍摄）；
+2. 点它弹出的是 MikotoHelper 自己的菜单：插件管理 / Misaka 设置 / **Misaka 用户设置** / 语音设置 / 清除当前窗口记录 / 消息库 / 文案库 / 消息屏蔽 / 备忘录 / 返回主页；
+3. 进「Misaka 用户设置」后，页面上**直接写着「当前会话 ID：wxid_3204302043512」**，下面就是「分组名称 → 默认分组」；点进去是完整的**分组列表**（意向客户 39 / 货代同行 2859 / C 18 / 测评 26 / F 17 / 代理 89 / 不打广告的 10 / 美线客户 36 / 美线代理 26 / 询价客户 258 / 默认分组 / 不收纳该会话），右上角还有「添加」。
+
+**这直接推翻了我之前两个假设：**
+
+- ~~「会话 ID 要靠猜微信的字段名」~~ → **MikotoHelper 自己就知道**，它页面上就显示着；
+- ~~「分组写入要自己拼 `addGroupData:` 调用」~~ → **它有现成 UI**，直接调出来用即可。
+
+**改动：**
+
+| # | 改动 |
+|---|---|
+| 1 | **会话 ID 识别链新增 ⓪ 级**（放在最前面，优先级最高）：从 `PJMisakaManager` 单例 → 成员变量 `settingVC`（即 `PJMisakaSettingViewController`）→ `m_nsUsrName` 读出。全程只读元数据，不走 KVC、不发消息 |
+| 2 | **新增菜单「① 打开 Mikoto 分组列表（实验·首选）」**：找到 MikotoHelper 的「Misaka 用户设置」实例 → 优先用它的 `m_nsUsrName`（拿不到才用我们自己识别的结果，直接写进它的成员变量）→ 依次尝试 `misaka_selectGroupAction` / `groupSettingFriendGroupIDAction` / `groupNameAction` / `groupSettingGroupAction`（**只调无参的**，逐个独立 `@try`）→ 都不行就退化为把这个页面 push 出来，让你自己点「分组名称」 |
+| 3 | **新增菜单「② 探测 Mikoto 分组接口（自动复制）」**：纯只读。输出 [A] 关键 selector 的实现者+完整 `typeEncoding`、[B] 9 个目标类的运行时方法表、[C] `PJMisakaManager` 实例全部成员变量取值、[D] `settingVC` 的成员变量取值、[E] 会话 ID 权威来源、[F] PJ* 类清单。一键复制发回即可 |
+| 4 | 诊断报告的「关键结论」段新增「MikotoHelper 分组接口（简版）」：会话 ID 权威值 / settingVC 是否找到 / 5 个关键 selector 由谁实现 |
+
+**静态逆向的收口结论（避免以后重复踩坑）**：对 `MikotoHelper.dylib` 做了完整的 ObjC 元数据重解析（`rev/objc2.py`、`rev/scan_methods.py`），结论是 —— `__objc_const` 里 167 个类的 `baseMethods` **全部是空表**，能扫到的 320 张方法表 / 4097 个方法里**不含** `addGroupData:`；而 `addGroupData:`、`misaka_selectGroupAction`、`groupSettingFriendGroupIDAction` 等**只出现在 `__objc_selrefs`（引用表）** 里 —— 即它们是**被 MikotoHelper 调用**的，**实现不在这个 dylib 里**（在另外的 Misaka 组件中）。**所以只能靠运行时探测来确定实现类与签名。**
 
 | **v1.7** | 「**点分组弹出：分组出现异常 / Property Name should be baseRequest**」（微信本体抛的异常，MikotoHelper 里没有这个串） | **① 全链路「阶段追踪」：异常弹窗直接写「死在哪个阶段」；② 异常摘要 = 阶段 + 异常自己的调用栈 + 当前线程调用栈 + 最近 30 行日志，一次性复制到剪贴板；③ 识别链 / provider 查找 / 写入流程各自再包一层 `@try`，任何异常都只会变成「识别失败 → 报告」或「调用报错：xxx（阶段 yyy）」，不再冒到外层；④ 新增「通用 setter 捕获」——把聊天窗口类（止于 UIViewController）所有对象型 setter 都挂上，只在值确实像会话 ID（wxid_ / @chatroom / gh_ / @openim）时才记录，解决「动态捕获一直是 (无)」** |
 

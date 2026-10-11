@@ -46,7 +46,7 @@
 
 #pragma mark - 常量
 
-static NSString *const kPJQGVersion          = @"1.8";
+static NSString *const kPJQGVersion          = @"1.9";
 static NSString *const kPJQGDefaultKindKey   = @"pjqg_default_kind";   // NSInteger, -1 = 未设置
 static NSString *const kPJQGBubbleVisibleKey = @"pjqg_bubble_visible";
 static NSString *const kPJQGSilentKey        = @"pjqg_silent_alert";
@@ -100,6 +100,10 @@ static NSString   *PJQGDumpException(NSException *e);
 static NSString   *PJQGTailOfLog(NSUInteger maxLines);
 static void         PJQGHookSettersGeneric(Class cls);
 static void         PJQGCaptureStage(NSString *stage);
+// v1.9：复用 MikotoHelper 自己的分组链路（Misaka 用户设置 → 分组名称）
+static NSString    *PJQGMikotoCurrentChatId(NSString **howOut);
+static NSString    *PJQGProbeMikotoGroup(void);
+static BOOL         PJQGOpenMikotoGroupList(UIViewController *from, NSString **detail);
 
 typedef NS_ENUM(NSInteger, PJQGKind) {
     PJQGKindGroup = 0,   // 群聊
@@ -1359,6 +1363,17 @@ static NSString *PJQGChatIdInner(id vc, NSString **how, NSMutableString *trace) 
     NSArray *kvcKeys = PJQGChatIdKeyCandidates();
     NSArray *selNames = PJQGChatIdSelCandidates();
 
+    // ⓪ MikotoHelper 自己认定的会话 —— v1.9 新增，最权威的来源。
+    //    用户截图证实：MikotoHelper 的「Misaka 用户设置」页上直接显示着「当前会话 ID」（wxid_…）。
+    //    既然它自己知道，就不必再猜微信的字段名。
+    PJQGSTAGE(@"识别⓪MikotoHelper");
+    {
+        NSString *how0 = nil;
+        NSString *v0 = PJQGMikotoCurrentChatId(&how0);
+        if (trace) [trace appendFormat:@"  ⓪ MikotoHelper = %@\n", v0 ?: @"(无)"];
+        if (v0.length) { if (how) *how = how0 ?: @"MikotoHelper"; return v0; }
+    }
+
     // ① 动态捕获
     PJQGSTAGE(@"识别①动态捕获");
     @try {
@@ -1696,6 +1711,318 @@ static PJQGApplyResult PJQGApply(NSString *chatId, PJQGKind kind, NSString **det
     }
 }
 
+#pragma mark - v1.9：复用 MikotoHelper 自己的分组链路
+//
+// 依据（用户真机截图）：MikotoHelper 自带完整链路 ——
+//   聊天框底部「Mikoto」→「Misaka 用户设置」→「分组名称」→ 选分组（意向客户/货代同行/…/不收纳该会话）
+// 而且「Misaka 用户设置」页上**直接显示着「当前会话 ID」**（wxid_xxx）。
+//
+// 所以这一版换思路：
+//   ① 会话 ID 不用再猜字段 —— MikotoHelper 自己就有（settingVC.m_nsUsrName），这是最权威的来源；
+//   ② 分组写入不用自己拼调用 —— 直接把它自己的「分组名称」页/动作调出来，复用它的全部逻辑。
+//
+// 安全约定：本模块**只读**为主；唯一的写动作（PJQGOpenMikotoGroupList）必须由用户显式点击触发，
+//   且调用前先落日志 + 上 HUD，并套「危险调用哨兵」，万一崩溃下次启动能自动进安全模式。
+
+// 安全读「对象型成员变量」：纯元数据 + object_getIvar，绝不走 KVC、绝不对入参发消息
+static id PJQGSafeIvarObject(id obj, NSString *name) {
+    if (!obj || name.length == 0) return nil;
+    @try {
+        Ivar iv = class_getInstanceVariable(object_getClass(obj), name.UTF8String);
+        if (!iv) return nil;
+        const char *te = ivar_getTypeEncoding(iv);
+        if (!te || te[0] != '@') return nil;
+        id v = object_getIvar(obj, iv);
+        if (!PJQGPointerLooksSane(v)) return nil;
+        if (PJQGIsClassObjectSafely(v)) return nil;
+        return v;
+    } @catch (NSException *e) { return nil; }
+}
+
+// 列出对象（含父类链）所有「对象型」成员变量及其取值类别 —— 只读
+static NSString *PJQGListObjectIvars(id obj, NSUInteger maxLines) {
+    NSMutableString *s = [NSMutableString string];
+    if (!obj) return @"    (无对象)\n";
+    NSUInteger n = 0;
+    @try {
+        int guard = 0;
+        for (Class k = object_getClass(obj); k && guard++ < 8; k = class_getSuperclass(k)) {
+            unsigned cnt = 0;
+            Ivar *ivs = class_copyIvarList(k, &cnt);
+            if (!ivs) continue;
+            for (unsigned i = 0; i < cnt; i++) {
+                const char *nm = ivar_getName(ivs[i]);
+                const char *te = ivar_getTypeEncoding(ivs[i]);
+                if (!nm || !te || te[0] != '@') continue;
+                if (n++ >= maxLines) { [s appendString:@"    ...(截断)\n"]; free(ivs); return s; }
+                id v = nil;
+                @try { v = object_getIvar(obj, ivs[i]); } @catch (NSException *e) { }
+                NSString *desc = @"nil";
+                if (PJQGPointerLooksSane(v)) {
+                    if (PJQGIsClassObjectSafely(v)) {
+                        desc = @"(类对象)";
+                    } else if ([v isKindOfClass:NSString.class]) {
+                        desc = [NSString stringWithFormat:@"\"%@\"", (NSString *)v];
+                    } else {
+                        desc = NSStringFromClass([v class]);
+                    }
+                }
+                [s appendFormat:@"    %-32s : %@\n", nm, desc];
+            }
+            free(ivs);
+        }
+    } @catch (NSException *e) { [s appendFormat:@"    (读取异常: %@)\n", e.reason]; }
+    return s;
+}
+
+// 拿 PJMisakaManager 实例：只调「无参 + 返回对象」的类方法，其他一律不碰
+static id PJQGMisakaManagerInstance(void) {
+    Class c = NSClassFromString(@"PJMisakaManager");
+    if (!c) return nil;
+    for (NSString *g in @[ @"sharedInstance", @"sharedManager", @"defaultManager", @"shared",
+                           @"manager", @"defaultInstance", @"instance", @"getInstance" ]) {
+        SEL s = NSSelectorFromString(g);
+        Method m = class_getClassMethod(c, s);
+        if (!m) continue;
+        if (method_getNumberOfArguments(m) != 2) continue;      // 只要无参
+        char rt[8] = {0};
+        method_getReturnType(m, rt, sizeof(rt));
+        if (rt[0] != '@') continue;                              // 只要返回对象
+        @try {
+            id v = ((id (*)(id, SEL))objc_msgSend)((id)c, s);
+            if (PJQGPointerLooksSane(v) && !PJQGIsClassObjectSafely(v)) return v;
+        } @catch (NSException *e) { } @catch (...) { }
+    }
+    return nil;
+}
+
+// 找 MikotoHelper 的「Misaka 用户设置」控制器实例（只读成员变量，不调任何方法）
+static id PJQGMikotoSettingVC(void) {
+    id mgr = PJQGMisakaManagerInstance();
+    if (!mgr) return nil;
+    @try {
+        id direct = PJQGSafeIvarObject(mgr, @"settingVC");
+        if (direct) {
+            NSString *dn = NSStringFromClass([direct class]);
+            if ([dn containsString:@"MisakaSetting"] || [dn containsString:@"Setting"]) return direct;
+        }
+        int guard = 0;
+        for (Class k = object_getClass(mgr); k && guard++ < 8; k = class_getSuperclass(k)) {
+            unsigned cnt = 0;
+            Ivar *ivs = class_copyIvarList(k, &cnt);
+            if (!ivs) continue;
+            for (unsigned i = 0; i < cnt; i++) {
+                const char *te = ivar_getTypeEncoding(ivs[i]);
+                if (!te || te[0] != '@') continue;
+                id v = nil;
+                @try { v = object_getIvar(mgr, ivs[i]); } @catch (NSException *e) { }
+                if (!PJQGPointerLooksSane(v) || PJQGIsClassObjectSafely(v)) continue;
+                if ([NSStringFromClass([v class]) containsString:@"MisakaSetting"]) { free(ivs); return v; }
+            }
+            free(ivs);
+        }
+    } @catch (NSException *e) { }
+    return nil;
+}
+
+// 从 MikotoHelper 读它自己认定的当前会话 ID（最权威）
+static NSString *PJQGMikotoCurrentChatId(NSString **howOut) {
+    @try {
+        id svc = PJQGMikotoSettingVC();
+        if (svc) {
+            id v = PJQGSafeIvarObject(svc, @"m_nsUsrName");
+            if ([v isKindOfClass:NSString.class] && [(NSString *)v length] > 0) {
+                if (howOut) *howOut = @"MikotoHelper settingVC.m_nsUsrName";
+                return (NSString *)v;
+            }
+        }
+    } @catch (NSException *e) { }
+    return nil;
+}
+
+// ── 只读探测报告（安全：不调用任何会改变状态的方法） ──────────────────
+static NSString *PJQGProbeMikotoGroup(void) {
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"===== MikotoHelper 分组接口探测 v%@ =====\n", kPJQGVersion];
+
+    // [A] 关键 selector 由谁实现 + 签名
+    @try {
+        [s appendString:@"\n--- [A] 关键 selector 的实现者 ---\n"];
+        NSArray *keys = @[ @"misaka_selectGroupAction", @"groupSettingFriendGroupIDAction",
+                           @"groupSettingNotTakeinAction:", @"selectGroupWithKey:", @"groupNameAction",
+                           @"groupSettingGroupAction", @"addGroupData:", @"addChatData:",
+                           @"addOtherGroupData:", @"rebuildMainSessions", @"backupGroupSetting:",
+                           @"reloadGroupData", @"setM_nsUsrName:", @"m_nsUsrName",
+                           @"MisakaGroupCreateWithSection:WithLogicController:WithDataSource:WithGroupDic:WithChatDic:WithOtherGroup:",
+                           @"initWithUserName:", @"chatDefaultGroupAction:", @"groupDefaultGroupAction:" ];
+        for (NSString *sn in keys) {
+            SEL sel = NSSelectorFromString(sn);
+            NSArray *cls = PJQGClassesImplementing(sel);
+            [s appendFormat:@"  %@  → [%lu] ", sn, (unsigned long)cls.count];
+            if (cls.count == 0) { [s appendString:@"(无)\n"]; continue; }
+            [s appendFormat:@"%@\n", [cls componentsJoinedByString:@", "]];
+            int shown = 0;
+            for (NSString *cn in cls) {
+                Class c = NSClassFromString(cn);
+                if (!c) continue;
+                [s appendFormat:@"        %@\n", PJQGMethodInfo(c, sel)];
+                if (++shown >= 3) { [s appendString:@"        ...(截断)\n"]; break; }
+            }
+        }
+    } @catch (NSException *e) { [s appendFormat:@"  (A 段异常: %@)\n", e.reason]; }
+
+    // [B] 目标类的运行时方法表（含完整 typeEncoding）
+    @try {
+        [s appendString:@"\n--- [B] 目标类的运行时方法表 ---\n"];
+        NSArray *targets = @[ @"PJMisakaSettingViewController", @"PJGroupListViewController",
+                              @"PJGroupManager", @"PJGroupDataModel", @"PJMisakaManager",
+                              @"PJGroupVC", @"PJSettingGroupVC", @"PJGroupContactViewController",
+                              @"PJGroupingTransmitViewController" ];
+        for (NSString *cn in targets) {
+            Class c = NSClassFromString(cn);
+            if (!c) { [s appendFormat:@"  %@ : (类不存在)\n", cn]; continue; }
+            unsigned cnt = 0;
+            Method *ms = class_copyMethodList(c, &cnt);
+            [s appendFormat:@"  %@ : %u 个自有方法\n", cn, cnt];
+            for (unsigned i = 0; i < cnt && i < 80; i++) {
+                const char *sn2 = sel_getName(method_getName(ms[i]));
+                const char *te2 = method_getTypeEncoding(ms[i]);
+                [s appendFormat:@"      - %-56s %s\n", sn2 ? sn2 : "?", te2 ? te2 : ""];
+            }
+            if (cnt > 80) [s appendString:@"      ...(截断)\n"];
+            free(ms);
+        }
+    } @catch (NSException *e) { [s appendFormat:@"  (B 段异常: %@)\n", e.reason]; }
+
+    // [C] PJMisakaManager 实例
+    @try {
+        [s appendString:@"\n--- [C] PJMisakaManager 实例 ---\n"];
+        id mgr = PJQGMisakaManagerInstance();
+        [s appendFormat:@"  找到: %@\n", mgr ? NSStringFromClass([mgr class]) : @"(未找到)"];
+        if (mgr) [s appendString:PJQGListObjectIvars(mgr, 40)];
+    } @catch (NSException *e) { [s appendFormat:@"  (C 段异常: %@)\n", e.reason]; }
+
+    // [D] Misaka 用户设置页实例
+    @try {
+        [s appendString:@"\n--- [D] Misaka 用户设置页实例 ---\n"];
+        id svc = PJQGMikotoSettingVC();
+        [s appendFormat:@"  找到: %@\n", svc ? NSStringFromClass([svc class]) : @"(未找到)"];
+        if (svc) {
+            id usr = PJQGSafeIvarObject(svc, @"m_nsUsrName");
+            [s appendFormat:@"  m_nsUsrName = %@\n", usr ?: @"(nil)"];
+            [s appendString:PJQGListObjectIvars(svc, 20)];
+        }
+    } @catch (NSException *e) { [s appendFormat:@"  (D 段异常: %@)\n", e.reason]; }
+
+    // [E] 会话 ID 权威来源
+    @try {
+        [s appendString:@"\n--- [E] 会话 ID（MikotoHelper 权威来源） ---\n"];
+        NSString *how = nil;
+        NSString *mk = PJQGMikotoCurrentChatId(&how);
+        [s appendFormat:@"  MikotoHelper 自己认的 : %@  (%@)\n", mk ?: @"(取不到)", how ?: @"-"];
+    } @catch (NSException *e) { [s appendFormat:@"  (E 段异常: %@)\n", e.reason]; }
+
+    // [F] PJ* 类清单
+    @try {
+        [s appendString:@"\n--- [F] PJ* 类清单（含 Group/Misaka/Setting） ---\n"];
+        NSArray *pj = PJQGClassNamesWithPrefix(@"PJ");
+        NSMutableArray *hit = [NSMutableArray array];
+        for (NSString *n in pj) {
+            if ([n containsString:@"Group"] || [n containsString:@"Misaka"] ||
+                [n containsString:@"Setting"]) [hit addObject:n];
+        }
+        [s appendFormat:@"  PJ* 共 %lu 个，命中 %lu 个:\n  %@\n",
+            (unsigned long)pj.count, (unsigned long)hit.count, [hit componentsJoinedByString:@", "]];
+    } @catch (NSException *e) { [s appendFormat:@"  (F 段异常: %@)\n", e.reason]; }
+
+    [s appendString:@"\n===== 以上整段复制发回即可 =====\n"];
+    return s;
+}
+
+// ── 实验动作：把 MikotoHelper 自己的分组链路调出来（用户显式点击才执行） ──
+static BOOL PJQGOpenMikotoGroupList(UIViewController *from, NSString **detail) {
+    if (detail) *detail = nil;
+    @try {
+        id svc = PJQGMikotoSettingVC();
+        if (!svc) {
+            if (detail) *detail = @"没找到「Misaka 用户设置」实例（PJMisakaManager 单例不可达，或它还没创建过该页面）";
+            return NO;
+        }
+        NSString *cn = NSStringFromClass([svc class]);
+
+        // 会话 ID：优先 MikotoHelper 自己认的；为空则用我们的识别结果写进它的成员变量
+        NSString *cid = nil;
+        NSString *srcHow = nil;
+        id v = PJQGSafeIvarObject(svc, @"m_nsUsrName");
+        if ([v isKindOfClass:NSString.class] && [(NSString *)v length] > 0) {
+            cid = (NSString *)v;
+            srcHow = @"MikotoHelper";
+        } else {
+            NSString *h2 = nil;
+            NSString *mine = PJQGChatId(from, &h2);
+            if (mine.length) {
+                Ivar iv = class_getInstanceVariable(object_getClass(svc), "m_nsUsrName");
+                if (iv) {
+                    @try { object_setIvar(svc, iv, mine); cid = mine; srcHow = h2; }
+                    @catch (NSException *e) { }
+                }
+            }
+        }
+        if (!cid.length) {
+            if (detail) *detail = @"拿不到会话 ID（settingVC.m_nsUsrName 为空，自身识别也失败）";
+            return NO;
+        }
+        PJQGLog(@"[mikoto] settingVC=%@ 会话ID=%@ 来源=%@", cn, cid, srcHow ?: @"?");
+
+        // ① 调它自己的「分组名称」动作（只调无参的，逐个单独 @try）
+        NSArray *acts = @[ @"misaka_selectGroupAction", @"groupSettingFriendGroupIDAction",
+                           @"groupNameAction", @"groupSettingGroupAction" ];
+        Class sc = object_getClass(svc);
+        for (NSString *an in acts) {
+            SEL s = NSSelectorFromString(an);
+            Method m = class_getInstanceMethod(sc, s);
+            if (!m) continue;
+            if (method_getNumberOfArguments(m) != 2) continue;     // 只要无参
+            PJQGHUD([NSString stringWithFormat:@"调用 Mikoto 的 %@ …", an], YES);
+            PJQGLog(@"[mikoto] 即将调用 -[%@ %@]", cn, an);
+            PJQGRiskyBegin("mikoto.action");
+            @try {
+                ((void (*)(id, SEL))objc_msgSend)(svc, s);
+                PJQGRiskyEnd();
+                if (detail) *detail = [NSString stringWithFormat:
+                    @"已调用 MikotoHelper 的 -[%@ %@]（会话 ID %@，来源 %@）", cn, an, cid, srcHow ?: @"?"];
+                return YES;
+            } @catch (NSException *e) {
+                PJQGRiskyEnd();
+                PJQGLog(@"[mikoto] -[%@ %@] 抛异常: %@", cn, an, e.reason);
+                if (detail) *detail = [NSString stringWithFormat:@"调 %@ 抛异常: %@", an, e.reason];
+            } @catch (...) { PJQGRiskyEnd(); }
+        }
+
+        // ② 退一步：把它自己的页面 push 出来（不调任何未知动作）
+        UINavigationController *nav = from.navigationController;
+        if (nav && [svc isKindOfClass:UIViewController.class]) {
+            PJQGRiskyBegin("mikoto.push");
+            @try {
+                [nav pushViewController:(UIViewController *)svc animated:YES];
+                PJQGRiskyEnd();
+                if (detail) *detail = [NSString stringWithFormat:
+                    @"已打开「Misaka 用户设置」页（会话 ID %@），请点「分组名称」", cid];
+                return YES;
+            } @catch (NSException *e) {
+                PJQGRiskyEnd();
+                if (detail) *detail = [NSString stringWithFormat:@"push 失败: %@", e.reason];
+                return NO;
+            }
+        }
+        if (detail) *detail = @"找到了 settingVC，但它没有可用的「分组名称」动作，也无法 push";
+        return NO;
+    } @catch (NSException *e) {
+        if (detail) *detail = [NSString stringWithFormat:@"异常: %@", e.reason];
+        return NO;
+    }
+}
+
 #pragma mark - 诊断报告
 
 static NSString *PJQGDeviceName(void) {
@@ -1754,6 +2081,24 @@ static NSString *PJQGDiagnoseDetail(id chatVC) {
     } @catch (NSException *e) {
         [s appendFormat:@"  ⚠︎ 当前聊天窗口段异常: %@\n", e.reason];
     }
+
+    // v1.9：MikotoHelper 自己的分组接口（简版）—— 有没有把柄可抓，一眼就能看出
+    @try {
+        [s appendString:@"\n--- MikotoHelper 分组接口（简版） ---\n"];
+        NSString *how0 = nil;
+        NSString *mk = PJQGMikotoCurrentChatId(&how0);
+        [s appendFormat:@"  ⓪ MikotoHelper 会话ID = %@  (%@)\n", mk ?: @"(取不到)", how0 ?: @"-"];
+        id svc = PJQGMikotoSettingVC();
+        [s appendFormat:@"  Misaka 用户设置页 = %@\n",
+            svc ? NSStringFromClass([svc class]) : @"(未找到：PJMisakaManager.settingVC 为空)"];
+        for (NSString *sn in @[ @"addGroupData:", @"misaka_selectGroupAction",
+                                @"groupSettingFriendGroupIDAction", @"groupSettingNotTakeinAction:",
+                                @"selectGroupWithKey:" ]) {
+            NSArray *c = PJQGClassesImplementing(NSSelectorFromString(sn));
+            [s appendFormat:@"  %@ → %@\n", sn,
+                c.count ? [c componentsJoinedByString:@", "] : @"(无人实现)"];
+        }
+    } @catch (NSException *e) { [s appendFormat:@"  (Mikoto 接口段异常: %@)\n", e.reason]; }
 
     @try {
         [s appendString:@"\n--- MikotoHelper 是否已加载 ---\n"];
@@ -2357,6 +2702,9 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
 - (UIViewController *)topmost;
 - (void)presentMenu;
 - (void)runSelfTest;
+// v1.9
+- (void)probeMikotoGroup;
+- (void)openMikotoGroupList;
 - (void)presentPickerSetDefault:(BOOL)setDefault;
 - (void)presentKindChooserForManualId:(NSString *)chatId;
 - (void)anchorPopover:(UIAlertController *)sheet;
@@ -2709,6 +3057,15 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
                         style:UIAlertActionStyleDefault
                         handler:^(UIAlertAction *a) { [self runSelfTest]; }]];
 
+    // v1.9：直接复用 MikotoHelper 自己的分组链路
+    [sheet addAction:[UIAlertAction actionWithTitle:@"① 打开 Mikoto 分组列表（实验·首选）"
+                        style:UIAlertActionStyleDefault
+                        handler:^(UIAlertAction *a) { [self openMikotoGroupList]; }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"② 探测 Mikoto 分组接口（自动复制）"
+                        style:UIAlertActionStyleDefault
+                        handler:^(UIAlertAction *a) { [self probeMikotoGroup]; }]];
+
     [sheet addAction:[UIAlertAction actionWithTitle:@"手动输入会话 ID…"
                         style:UIAlertActionStyleDefault
                         handler:^(UIAlertAction *a) { [self manualInput]; }]];
@@ -2833,6 +3190,35 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
     @try { UIPasteboard.generalPasteboard.string = s; } @catch (NSException *e) { }
     PJQGHUD(@"自检完成 ✓ 已复制到剪贴板", NO);
     PJQGShowReport(vc, s, NO, nil);
+}
+
+// v1.9：只读探测 MikotoHelper 的分组接口（不做任何调用，绝对安全）
+- (void)probeMikotoGroup {
+    PJQGHUD(@"探测 Mikoto 分组接口…", YES);
+    NSString *rep = nil;
+    @try { rep = PJQGProbeMikotoGroup(); }
+    @catch (NSException *e) { rep = [NSString stringWithFormat:@"探测失败: %@", e.reason]; }
+    @catch (...) { rep = @"探测失败：非 Objective-C 异常"; }
+    PJQGLog(@"[probe]\n%@", rep);
+    @try { UIPasteboard.generalPasteboard.string = rep ?: @""; } @catch (NSException *e) { }
+    PJQGHUD(@"探测完成 ✓ 已复制到剪贴板", NO);
+    PJQGShowReport(self.host, rep, NO, nil);
+}
+
+// v1.9：尝试把 MikotoHelper 自己的「分组名称」链路调出来（用户显式点击才执行）
+- (void)openMikotoGroupList {
+    PJQGHUD(@"正在打开 Mikoto 的分组列表…", YES);
+    NSString *detail = nil;
+    BOOL ok = NO;
+    @try { ok = PJQGOpenMikotoGroupList(self.host, &detail); }
+    @catch (NSException *e) { detail = [NSString stringWithFormat:@"异常: %@", e.reason]; }
+    @catch (...) { detail = @"非 Objective-C 异常"; }
+    PJQGLog(@"[mikoto] openGroupList ok=%d  %@", ok, detail ?: @"-");
+    PJQGHUD(ok ? [NSString stringWithFormat:@"✓ %@", detail ?: @""]
+               : [NSString stringWithFormat:@"✗ %@", detail ?: @"失败"], NO);
+    if (!ok) {
+        PJQGAlert(@"未能打开 Mikoto 分组列表", detail ?: @"未知原因", nil);
+    }
 }
 
 - (void)presentPickerSetDefault:(BOOL)setDefault {
@@ -3142,16 +3528,16 @@ static void PJQGShowLaunchAlert(void) {
     } else {
         msg = [NSString stringWithFormat:
                @"插件已被微信加载（v%@）。\n\n"
-                "★ 本版已移除导致微信闪退的「批量挂钩」逻辑：不再在启动时对所有类做上万次方法替换，"
-                "也不会再去替换 setView: / setTitle: 这类 UIKit 热方法。\n\n"
-                "进入任意聊天窗口：右侧有可拖动的「分组」按钮，旁边蓝色「诊」按钮直接打开诊断报告；"
-                "右上角也有「分组」。\n\n"
+                "★ v1.9 换了思路：不再自己造分组按钮，而是直接复用 MikotoHelper 自己的分组链路。\n\n"
+                "用法：长按「分组」→「① 打开 Mikoto 分组列表（实验·首选）」。\n"
+                "它会去调 MikotoHelper 自己的「Misaka 用户设置 → 分组名称」那条路；"
+                "如果成功，屏幕上会直接出现它的分组列表（意向客户 / 货代同行 / … / 不收纳该会话），点一个就完成分组。\n\n"
+                "如果没打开，改点「② 探测 Mikoto 分组接口（自动复制）」，"
+                "把复制到的整段发我，我就能确定该调哪个方法。\n\n"
+                "会话 ID 现在优先采用 MikotoHelper 自己认定的那个（就是它「用户设置」页上显示的那个）。\n\n"
                 "单击「分组」= 归入默认分组；长按 = 菜单。\n\n"
-                "点一下「分组」，屏幕上会立刻出现提示（「已响应 · 正在识别会话」），之后每一步都会继续显示结果。\n\n"
-                "如果弹出「分组出现异常」，正文里会写「阶段：xxx」（死在识别 / provider / 调用哪一步），"
-                "并且会把【阶段 + 异常调用栈 + 最近日志】自动复制到剪贴板 —— 直接粘贴发我即可。\n\n"
-                "如果提示「未识别到会话」，会自动弹出报告并复制到剪贴板，直接发我即可；"
-                "也可以长按「分组」→「自检」，把自检结果整段发我。\n\n日志：%@",
+                "如果弹出「分组出现异常」，正文里会写「阶段：xxx」，"
+                "并且会把【阶段 + 调用栈 + 最近日志】自动复制到剪贴板 —— 直接粘贴发我即可。\n\n日志：%@",
                 kPJQGVersion, PJQGLogPath()];
     }
 

@@ -1,8 +1,8 @@
 Package: com.pj.mikotoquickgroup
 Name: MikotoQuickGroup
-Version: 1.8.0
+Version: 1.9.0
 Architecture: iphoneos-arm64
-Description: 独立插件 —— 在微信聊天界面提供「快速分组」按钮，一键把当前会话归入 MikotoHelper 的指定分组（默认分组记忆）；内置诊断报告与会话 ID 识别。v1.8：紧急修复「微信整体闪退」—— 永久移除 v1.7 引入的批量通用 setter 挂钩（启动后于主线程装上万次 hook，被 iOS watchdog 杀进程；且会替换 setView:/setTitle: 等 UIKit 热方法、回调里还会挖野指针）；同时彻底移除所有 respondsToSelector: 调用（它会触发微信 protobuf 基类的 +initialize 并抛异常）。保留 v1.7 的阶段追踪与异常调用栈自诊断。
+Description: 独立插件 —— 在微信聊天界面提供「快速分组」按钮，一键把当前会话归入 MikotoHelper 的指定分组（默认分组记忆）；内置诊断报告与会话 ID 识别。v1.9：换思路 —— 不再自己实现分组写入，改为直接复用 MikotoHelper 自己的链路（Misaka 用户设置 → 分组名称）。新增最权威的会话 ID 来源（PJMisakaManager.settingVC.m_nsUsrName，即 MikotoHelper 自己「用户设置」页上显示的那个）；长按菜单新增「打开 Mikoto 分组列表（实验）」与「探测 Mikoto 分组接口（自动复制）」。v1.8 起已永久移除导致微信闪退的批量 setter 挂钩与所有 respondsToSelector: 调用。
 Maintainer: local
 Author: local
 Section: Tweaks

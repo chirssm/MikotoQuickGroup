@@ -329,13 +329,17 @@ static BOOL PJQGApply(NSString *chatId, PJQGKind kind) {
 
 - (void)viewDidLoad {
     %orig;
-    [[PJQGChatAction actionFor:self] install];
+    // 显式转型：BaseMsgContentViewController 在本编译单元内无声明，
+    // clang 无法推出其继承链，需手动转成 UIViewController *
+    [[PJQGChatAction actionFor:(UIViewController *)self] install];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
     // 每次出现都走一遍 install（幂等）：防止微信后续重设 rightBarButtonItems 把按钮冲掉
-    [[PJQGChatAction actionFor:self] install];
+    // 显式转型：BaseMsgContentViewController 在本编译单元内无声明，
+    // clang 无法推出其继承链，需手动转成 UIViewController *
+    [[PJQGChatAction actionFor:(UIViewController *)self] install];
 }
 
 %end

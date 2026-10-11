@@ -1,24 +1,25 @@
 // ============================================================================
-//  MikotoQuickGroup v1.1  —— 微信聊天界面「快速分组」按钮（诊断增强版）
+//  MikotoQuickGroup v1.2  —— 微信聊天界面「快速分组」按钮（崩溃加固版）
 // ----------------------------------------------------------------------------
 //  依赖宿主 : WeChat (com.tencent.xin) + MikotoHelper.dylib（提供 Misaka 分组能力）
 //
-//  v1.1 相比 v1.0 的改动（针对"完全没反应"）：
-//   1. 【自证加载】%ctor 启动后弹窗 + 写日志文件，明确告诉你 dylib 有没有被加载
-//   2. 【多类名匹配】不再只 hook BaseMsgContentViewController，改为 hook
-//      UIViewController 并在运行时按多种特征识别聊天窗口（类名 + 是否响应 m_nsChatName）
-//      —— 微信改类名也不会失效
-//   3. 【悬浮兜底】导航栏按钮之外，额外提供可拖动的悬浮球（可在菜单里开关）
-//      —— 即使微信用自绘导航栏，按钮也一定看得见
-//   4. 【运行时探测】自动扫描 MikotoHelper 的全部 PJ* 类，找出真正实现了
-//      addGroupData:/addChatData:/addOtherGroupData: 的对象（含对象图有界搜索）
-//   5. 【参数自适应】读取方法的 type encoding，判断该传 NSString 还是会话对象
-//   6. 【诊断报告】长按按钮 →「查看诊断报告」，可一键复制发给开发者
+//  v1.2 针对「点了就闪退」的改动：
+//   1. 【崩溃取证】注册 NSUncaughtExceptionHandler + signal 处理器，
+//      闪退前沿面包屑与调用栈写进日志文件，事后可查（无需连线 Xcode）
+//   2. 【危险调用哨兵】每次调用 MikotoHelper 前后各写一次 NSUserDefaults 标记；
+//      下次启动若发现标记仍在 = 上次就是死在这一步 → 自动进入安全模式并弹窗告知
+//   3. 【先验签后调用】调用前解析方法签名（参数个数 + 每个参数的类型编码），
+//      只有在我们能提供正确类型参数时才调用；类型对不上就"不调用只记录"
+//      —— 彻底消灭"用错参数把人调崩"
+//   4. 【接口探测】新增只读探测：打印候选选择子在候选类上的完整签名
+//   5. 【首点加固】弹窗改从"最顶层 VC"present；popover 锚点仅在存在时设置；
+//      全流程 @try/@catch
+//   6. 【缓存】类扫描 / provider 查找结果缓存，避免重复重活儿卡主线程
 //
 //  交互约定 :
 //    · 单击按钮  → 直接归入「默认分组」；未设置默认则弹选择器并把选择存为默认
-//    · 长按按钮  → 菜单：修改默认 / 本次归入其他 / 清除默认 / 诊断报告 / 悬浮球开关
-//    · 按钮标题  → 导航栏显示「分组·群聊」，悬浮球显示「群聊」，未设置显示「分组」
+//    · 长按按钮  → 菜单：修改默认 / 本次归入其他 / 清除默认 / 接口探测 / 安全模式 / 悬浮球
+//    · 按钮标题  → 导航栏「分组·群聊」，悬浮球「群聊」，未设置显示「分组」
 // ============================================================================
 
 #import <UIKit/UIKit.h>
@@ -26,7 +27,12 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <stdarg.h>
+#import <stdio.h>
+#import <string.h>
 #import <unistd.h>
+#import <fcntl.h>
+#import <signal.h>
+#import <execinfo.h>
 #import <sys/utsname.h>
 
 #pragma mark - 常量
@@ -34,8 +40,16 @@
 static NSString *const kPJQGDefaultKindKey = @"pjqg_default_kind";   // NSInteger, -1 = 未设置
 static NSString *const kPJQGBubbleVisibleKey = @"pjqg_bubble_visible";
 static NSString *const kPJQGSilentKey = @"pjqg_silent_alert";
+static NSString *const kPJQGRiskyFlagKey = @"pjqg_risky_open";       // 危险调用哨兵
+static NSString *const kPJQGSafeModeKey = @"pjqg_safe_mode";
 static const void    *kPJQGActionKey = &kPJQGActionKey;
 static const void    *kPJQGBubbleKey = &kPJQGBubbleKey;
+static const char    *kPJQGLogFile = "/var/mobile/Documents/MikotoQuickGroup.log";
+
+// 前向声明
+static BOOL PJQGIsClassObjectSafely(id o);
+static NSString *PJQGLogPath(void);
+static void PJQGLog(NSString *fmt, ...);
 
 typedef NS_ENUM(NSInteger, PJQGKind) {
     PJQGKindGroup = 0,   // 群聊
@@ -52,10 +66,19 @@ static NSString *PJQGKindName(PJQGKind k) {
     return @"未知";
 }
 
+static NSString *PJQGSelectorForKind(PJQGKind k) {
+    switch (k) {
+        case PJQGKindGroup: return @"addGroupData:";
+        case PJQGKindChat:  return @"addChatData:";
+        case PJQGKindOther: return @"addOtherGroupData:";
+    }
+    return nil;
+}
+
 #pragma mark - 日志（文件 + 内存报告）
 
-static NSMutableString *gPJQGReport = nil;   // 诊断报告（内存）
-static NSString        *gPJQGLogPath = nil;  // 日志落盘路径
+static NSMutableString *gPJQGReport = nil;
+static NSString        *gPJQGLogPath = nil;
 
 static NSString *PJQGLogPath(void) {
     if (gPJQGLogPath) return gPJQGLogPath;
@@ -77,43 +100,133 @@ static NSString *PJQGLogPath(void) {
     return gPJQGLogPath;
 }
 
-static void PJQGLog(NSString *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    if (!s) return;
-
-    NSLog(@"[MikotoQuickGroup] %@", s);
+static void PJQGLogWrite(NSString *line) {
+    if (line.length == 0) return;
+    NSLog(@"[MikotoQuickGroup] %@", line);
 
     if (!gPJQGReport) gPJQGReport = [NSMutableString string];
-    [gPJQGReport appendFormat:@"%@\n", s];
-    // 内存报告只保留尾部（防止无限增长）
+    [gPJQGReport appendFormat:@"%@\n", line];
     if (gPJQGReport.length > 24000) {
         [gPJQGReport deleteCharactersInRange:NSMakeRange(0, 8000)];
         NSRange nl = [gPJQGReport rangeOfString:@"\n"];
         if (nl.location != NSNotFound) [gPJQGReport deleteCharactersInRange:NSMakeRange(0, NSMaxRange(nl))];
     }
 
-    // 落盘（失败静默）
     NSString *p = PJQGLogPath();
     if (p.length == 0) return;
     NSFileManager *fm = NSFileManager.defaultManager;
     NSDictionary *attr = [fm attributesOfItemAtPath:p error:NULL];
-    if (attr && [attr[NSFileSize] unsignedLongLongValue] > 256 * 1024) [fm removeItemAtPath:p error:NULL];
+    if (attr && [attr[NSFileSize] unsignedLongLongValue] > 320 * 1024) [fm removeItemAtPath:p error:NULL];
 
-    NSString *line = [s stringByAppendingString:@"\n"];
-    NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *full = [line stringByAppendingString:@"\n"];
+    NSData *d = [full dataUsingEncoding:NSUTF8StringEncoding];
     if (!d) return;
     if (![fm fileExistsAtPath:p]) { [d writeToFile:p atomically:YES]; return; }
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
     if (!fh) return;
     @try { [fh seekToEndOfFile]; [fh writeData:d]; }
-    @catch (NSException *e) { /* 忽略 */ }
+    @catch (NSException *e) { }
     @finally { [fh closeFile]; }
 }
 
-#pragma mark - 默认分组持久化
+static void PJQGLog(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    if (!s) return;
+    @try { PJQGLogWrite(s); } @catch (NSException *e) { }
+}
+
+#pragma mark - 崩溃取证（崩溃现场也要能落盘，故用最底层调用）
+
+static void PJQGRawWrite(const char *s) {
+    if (!s) return;
+    int fd = open(kPJQGLogFile, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) fd = open("/tmp/MikotoQuickGroup.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    ssize_t w = write(fd, s, strlen(s));
+    (void)w;
+    close(fd);
+}
+
+static NSUncaughtExceptionHandler *gPJQGPrevExceptionHandler = NULL;
+
+static void PJQGExceptionHandler(NSException *e) {
+    @try {
+        NSMutableString *s = [NSMutableString string];
+        [s appendString:@"\n!!! 未捕获异常 (ObjC) !!!\n"];
+        [s appendFormat:@"name    : %@\n", e.name];
+        [s appendFormat:@"reason  : %@\n", e.reason];
+        [s appendFormat:@"userInfo: %@\n", e.userInfo];
+        [s appendString:@"callStackSymbols:\n"];
+        for (NSString *f in e.callStackSymbols) [s appendFormat:@"  %@\n", f];
+        PJQGRawWrite(s.UTF8String);
+    } @catch (NSException *x) { }
+    if (gPJQGPrevExceptionHandler) gPJQGPrevExceptionHandler(e);
+}
+
+static void PJQGSignalHandler(int sig) {
+    const char *names[] = { "", "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP",
+                            "SIGABRT", "SIGEMT", "SIGFPE", "SIGKILL", "SIGBUS",
+                            "SIGSEGV", "SIGSYS", "SIGPIPE", "SIGALRM", "SIGTERM" };
+    const char *nm = (sig >= 1 && sig <= 15) ? names[sig] : "SIG?";
+
+    char head[256];
+    snprintf(head, sizeof(head), "\n!!! 致命信号 %d (%s) !!!\nbacktrace:\n", sig, nm);
+    PJQGRawWrite(head);
+
+    void *frames[64];
+    int n = backtrace(frames, 64);
+    if (n > 0) {
+        int fd = open(kPJQGLogFile, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd < 0) fd = open("/tmp/MikotoQuickGroup.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) { backtrace_symbols_fd(frames, n, fd); close(fd); }
+    }
+    PJQGRawWrite("\n--- end ---\n");
+
+    // 交还系统，保证 iOS 仍会生成 .ips 崩溃报告
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void PJQGInstallCrashHandlers(void) {
+    gPJQGPrevExceptionHandler = NSGetUncaughtExceptionHandler();
+    NSSetUncaughtExceptionHandler(&PJQGExceptionHandler);
+    int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGTRAP, SIGFPE };
+    for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = PJQGSignalHandler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_NODEFER;
+        sigaction(sigs[i], &sa, NULL);
+    }
+}
+
+#pragma mark - 危险调用哨兵
+
+// 调用 MikotoHelper 前落标记，正常返回后清掉。
+// 下次启动若标记还在 = 上次运行死在这个调用里 → 自动进安全模式
+static void PJQGRiskyBegin(const char *op) {
+    PJQGLog(@"[risky] BEGIN %s", op);
+    @try {
+        NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+        [d setObject:[NSString stringWithUTF8String:op] forKey:kPJQGRiskyFlagKey];
+        [d synchronize];
+    } @catch (NSException *e) { }
+}
+
+static void PJQGRiskyEnd(void) {
+    @try {
+        NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+        [d removeObjectForKey:kPJQGRiskyFlagKey];
+        [d synchronize];
+    } @catch (NSException *e) { }
+    PJQGLog(@"[risky] END");
+}
+
+#pragma mark - 持久化
 
 static NSInteger PJQGDefaultKind(void) {
     NSNumber *n = [[NSUserDefaults standardUserDefaults] objectForKey:kPJQGDefaultKindKey];
@@ -129,75 +242,101 @@ static void PJQGSetDefaultKind(NSInteger k) {
 
 static BOOL PJQGBubbleVisible(void) {
     NSNumber *n = [[NSUserDefaults standardUserDefaults] objectForKey:kPJQGBubbleVisibleKey];
-    return n ? n.boolValue : YES;   // 默认开启（诊断期内先保证"看得见"）
+    return n ? n.boolValue : YES;
 }
 
 static void PJQGSetBubbleVisible(BOOL v) {
-    [[NSUserDefaults standardUserDefaults] setBool:v forKey:kPJQGBubbleVisibleKey];
-    [[NSUserDefaults standardUserDefaults] synchronize];
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    [d setBool:v forKey:kPJQGBubbleVisibleKey];
+    [d synchronize];
+}
+
+static BOOL PJQGSafeMode(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kPJQGSafeModeKey];
+}
+
+static void PJQGSetSafeMode(BOOL v) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    [d setBool:v forKey:kPJQGSafeModeKey];
+    [d synchronize];
 }
 
 #pragma mark - 轻量 Toast
 
 static void PJQGToast(UIView *host, NSString *text) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *w = host.window;
-        if (!w) {
-            for (UIWindow *win in UIApplication.sharedApplication.windows) {
-                if (win.isKeyWindow) { w = win; break; }
+        @try {
+            UIWindow *w = host.window;
+            if (!w) {
+                for (UIWindow *win in UIApplication.sharedApplication.windows) {
+                    if (win.isKeyWindow) { w = win; break; }
+                }
             }
-        }
-        if (!w) return;
+            if (!w) return;
 
-        UILabel *l = [[UILabel alloc] init];
-        l.text = text;
-        l.textColor = UIColor.whiteColor;
-        l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-        l.textAlignment = NSTextAlignmentCenter;
-        l.numberOfLines = 0;
-        l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.84];
-        l.layer.cornerRadius = 10;
-        l.clipsToBounds = YES;
+            UILabel *l = [[UILabel alloc] init];
+            l.text = text;
+            l.textColor = UIColor.whiteColor;
+            l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+            l.textAlignment = NSTextAlignmentCenter;
+            l.numberOfLines = 0;
+            l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.84];
+            l.layer.cornerRadius = 10;
+            l.clipsToBounds = YES;
 
-        CGSize max = CGSizeMake(w.bounds.size.width - 80, CGFLOAT_MAX);
-        CGSize sz = [l sizeThatFits:max];
-        l.frame = CGRectMake(0, 0, sz.width + 34, sz.height + 22);
-        l.center = CGPointMake(w.bounds.size.width / 2, w.bounds.size.height * 0.76);
-        [w addSubview:l];
+            CGSize max = CGSizeMake(w.bounds.size.width - 80, CGFLOAT_MAX);
+            CGSize sz = [l sizeThatFits:max];
+            l.frame = CGRectMake(0, 0, sz.width + 34, sz.height + 22);
+            l.center = CGPointMake(w.bounds.size.width / 2, w.bounds.size.height * 0.76);
+            [w addSubview:l];
 
-        l.alpha = 0;
-        [UIView animateWithDuration:0.18 animations:^{ l.alpha = 1.0; }
-                         completion:^(BOOL f) {
-            [UIView animateWithDuration:0.30 delay:1.30 options:0
-                             animations:^{ l.alpha = 0.0; }
-                             completion:^(BOOL f2) { [l removeFromSuperview]; }];
-        }];
+            l.alpha = 0;
+            [UIView animateWithDuration:0.18 animations:^{ l.alpha = 1.0; }
+                             completion:^(BOOL f) {
+                [UIView animateWithDuration:0.30 delay:1.40 options:0
+                                 animations:^{ l.alpha = 0.0; }
+                                 completion:^(BOOL f2) { [l removeFromSuperview]; }];
+            }];
+        } @catch (NSException *e) { }
     });
 }
 
-#pragma mark - 运行时反射工具
+#pragma mark - 运行时反射
 
-// 收集「实例方法或类方法」中包含 sel 的类名（prefix 为 nil 表示不过滤）
-static NSArray *PJQGClassesRespondingTo(SEL sel) {
+static BOOL PJQGIsClassObjectSafely(id o) {
+    if (!o) return NO;
+    @try { return class_isMetaClass(object_getClass(o)); } @catch (NSException *e) { return NO; }
+}
+
+static NSMutableDictionary *gPJQGSelClassCache = nil;   // selector 名 -> 类名数组
+
+static NSArray *PJQGClassesImplementing(SEL sel) {
     if (!sel) return @[];
+    if (!gPJQGSelClassCache) gPJQGSelClassCache = [NSMutableDictionary dictionary];
+    NSString *key = NSStringFromSelector(sel);
+    NSArray *cached = gPJQGSelClassCache[key];
+    if (cached) return cached;
+
     NSMutableArray *out = [NSMutableArray array];
     unsigned int count = 0;
     Class *all = objc_copyClassList(&count);
-    if (!all) return out;
-    for (unsigned int i = 0; i < count; i++) {
-        Class c = all[i];
-        if (!c) continue;
-        const char *nm = class_getName(c);
-        if (!nm) continue;
-        BOOL hit = (class_getInstanceMethod(c, sel) != NULL) ||
-                   (class_getClassMethod(c, sel) != NULL);
-        if (hit) [out addObject:[NSString stringWithUTF8String:nm]];
+    if (all) {
+        for (unsigned int i = 0; i < count; i++) {
+            Class c = all[i];
+            if (!c) continue;
+            const char *nm = class_getName(c);
+            if (!nm) continue;
+            if (class_getInstanceMethod(c, sel) != NULL || class_getClassMethod(c, sel) != NULL) {
+                [out addObject:[NSString stringWithUTF8String:nm]];
+            }
+        }
+        free(all);
     }
-    free(all);
+    gPJQGSelClassCache[key] = out;
     return out;
 }
 
-static NSArray *PJQGAllClassNamesWithPrefix(NSString *prefix) {
+static NSArray *PJQGClassNamesWithPrefix(NSString *prefix) {
     NSMutableArray *out = [NSMutableArray array];
     unsigned int count = 0;
     Class *all = objc_copyClassList(&count);
@@ -212,284 +351,267 @@ static NSArray *PJQGAllClassNamesWithPrefix(NSString *prefix) {
     return out;
 }
 
-// 取实例对象的所有对象型 ivar
-static void PJQGEnumerateIvars(Class cls, id obj, void (^blk)(NSString *name, id value)) {
-    Class cur = cls;
-    int guard = 0;
-    while (cur && cur != [NSObject class] && guard++ < 12) {
-        unsigned int n = 0;
-        Ivar *ivars = class_copyIvarList(cur, &n);
-        if (ivars) {
-            for (unsigned int i = 0; i < n; i++) {
-                const char *tn = ivar_getTypeEncoding(ivars[i]);
-                if (!tn || tn[0] != '@') continue;
-                const char *in = ivar_getName(ivars[i]);
-                @try {
-                    id v = object_getIvar(obj, ivars[i]);
-                    if (v && in) blk([NSString stringWithUTF8String:in], v);
-                } @catch (NSException *e) { /* 忽略 */ }
-            }
-            free(ivars);
-        }
-        cur = class_getSuperclass(cur);
+// 取方法（同时兼容类方法与实例方法）
+static Method PJQGGetMethod(id target, SEL sel, BOOL *isClassMethod) {
+    BOOL isClassObj = PJQGIsClassObjectSafely(target);
+    Class cls = isClassObj ? (Class)target : [target class];
+    if (!cls) return NULL;
+    Method m = NULL;
+    BOOL cm = NO;
+    if (isClassObj) {
+        m = class_getClassMethod(cls, sel); cm = YES;
+        if (!m) { m = class_getInstanceMethod(cls, sel); cm = NO; }
+    } else {
+        m = class_getInstanceMethod(cls, sel); cm = NO;
+        if (!m) { m = class_getClassMethod(cls, sel); cm = YES; }
     }
+    if (isClassMethod) *isClassMethod = cm;
+    return m;
 }
 
-static BOOL PJQGIsLeafObject(id o) {
-    return [o isKindOfClass:NSString.class] || [o isKindOfClass:NSNumber.class] ||
-           [o isKindOfClass:NSData.class]   || [o isKindOfClass:NSArray.class]  ||
-           [o isKindOfClass:NSDictionary.class] || [o isKindOfClass:NSSet.class];
-}
+// 方法签名描述（诊断输出用）
+static NSString *PJQGMethodInfo(id target, SEL sel) {
+    if (!target || !sel) return @"(nil)";
+    BOOL cm = NO;
+    Method m = PJQGGetMethod(target, sel, &cm);
+    if (!m) return [NSString stringWithFormat:@"(%@ %@) 方法不存在",
+                    PJQGIsClassObjectSafely(target) ? @"+" : @"-", NSStringFromSelector(sel)];
 
-// 有界对象图搜索：找到一个「响应 sel」的活对象
-static id PJQGGraphFind(SEL sel, id root, int depth, int *budget, NSMutableSet *seen, NSMutableArray *paths, NSString *path) {
-    if (!root || !sel || *budget <= 0) return nil;
-    if (PJQGIsLeafObject(root)) return nil;
-
-    NSValue *key = [NSValue valueWithNonretainedObject:root];
-    if ([seen containsObject:key]) return nil;
-    [seen addObject:key];
-    (*budget)--;
-
-    if ([root respondsToSelector:sel]) {
-        if (paths && path) [paths addObject:[NSString stringWithFormat:@"%@ (%@)", path, NSStringFromClass([root class])]];
-        return root;
+    unsigned n = method_getNumberOfArguments(m);
+    char rbuf[80] = {0};
+    method_getReturnType(m, rbuf, sizeof(rbuf));
+    NSMutableString *args = [NSMutableString string];
+    for (unsigned i = 0; i < n; i++) {
+        char b[80] = {0};
+        method_getArgumentType(m, i, b, sizeof(b));
+        if (i) [args appendString:@", "];
+        [args appendFormat:@"%s", b];
     }
-    if (depth <= 0) return nil;
-
-    __block id found = nil;
-    PJQGEnumerateIvars([root class], root, ^(NSString *name, id v) {
-        if (found || *budget <= 0) return;
-        found = PJQGGraphFind(sel, v, depth - 1, budget, seen, paths,
-                              path ? [NSString stringWithFormat:@"%@.%@", path, name] : name);
-    });
-    return found;
+    return [NSString stringWithFormat:@"%s[%@ %@] 返回=%s 参数(%u): %@",
+            cm ? "+" : "-", NSStringFromClass([target class]),
+            NSStringFromSelector(sel), rbuf, n, args];
 }
 
-// 收集若干"根对象"（主界面 VC 树 + 当前 VC）
-static NSArray *PJQGRootObjects(id extra) {
-    NSMutableArray *roots = [NSMutableArray array];
-    if (extra) [roots addObject:extra];
+static NSString *PJQGArgumentType(id target, SEL sel, unsigned idx) {
+    Method m = PJQGGetMethod(target, sel, NULL);
+    if (!m) return nil;
+    if (idx >= method_getNumberOfArguments(m)) return nil;
+    char b[80] = {0};
+    method_getArgumentType(m, idx, b, sizeof(b));
+    return [NSString stringWithUTF8String:b];
+}
 
-    UIApplication *app = UIApplication.sharedApplication;
-    UIWindow *kw = nil;
-    for (UIWindow *w in app.windows) { if (w.isKeyWindow) { kw = w; break; } }
-    if (!kw) kw = app.windows.firstObject;
+#pragma mark - 验签（核心安全闸门）
 
-    NSMutableArray *vcQueue = [NSMutableArray array];
-    UIViewController *rootVC = kw.rootViewController;
-    if (rootVC) [vcQueue addObject:rootVC];
-
-    int guard = 0;
-    while (vcQueue.count && guard++ < 40) {
-        UIViewController *vc = vcQueue.firstObject;
-        [vcQueue removeObjectAtIndex:0];
-        [roots addObject:vc];
-        if (vc.presentedViewController) [vcQueue addObject:vc.presentedViewController];
-        for (UIViewController *c in vc.childViewControllers) [vcQueue addObject:c];
-        if ([vc isKindOfClass:UINavigationController.class]) {
-            for (UIViewController *c in ((UINavigationController *)vc).viewControllers) [vcQueue addObject:c];
-        }
-        if ([vc isKindOfClass:UITabBarController.class]) {
-            UIViewController *sel = ((UITabBarController *)vc).selectedViewController;
-            if (sel) [vcQueue addObject:sel];
-        }
+// 0 个入参的方法：必须恰好是 self/_cmd 两个参数
+static BOOL PJQGSignatureAllows0(id target, SEL sel, NSString **why) {
+    Method m = PJQGGetMethod(target, sel, NULL);
+    if (!m) { if (why) *why = @"方法不存在"; return NO; }
+    unsigned n = method_getNumberOfArguments(m);
+    if (n != 2) {
+        if (why) *why = [NSString stringWithFormat:@"参数个数=%u（期望 2）", n];
+        return NO;
     }
-    return roots;
+    if (why) *why = @"参数个数=2 → 可调用";
+    return YES;
 }
 
-#pragma mark - MikotoHelper 桥接层
+// 1 个入参的方法：只有能提供正确类型参数时才允许调用
+static BOOL PJQGSignatureAllows(id target, SEL sel, NSString *stringArg, id *outArg, NSString **why) {
+    if (!target || !sel) { if (why) *why = @"target/sel 为空"; return NO; }
+    Method m = PJQGGetMethod(target, sel, NULL);
+    if (!m) { if (why) *why = @"方法不存在"; return NO; }
 
-// 会话 VC 的候选数据源：取会话 ID / 会话对象
+    unsigned n = method_getNumberOfArguments(m);
+    if (n != 3) {
+        if (why) *why = [NSString stringWithFormat:@"参数个数=%u（期望 3：self/_cmd/1入参）", n];
+        return NO;
+    }
+
+    NSString *type = PJQGArgumentType(target, sel, 2);
+    if (type.length == 0) { if (why) *why = @"读不到参数类型"; return NO; }
+
+    if ([type isEqualToString:@"@"] ||
+        [type isEqualToString:@"@\"NSString\""] ||
+        [type isEqualToString:@"@\"NSMutableString\""] ||
+        [type isEqualToString:@"@\"NSObject\""]) {
+        if (outArg) *outArg = stringArg;
+        if (why) *why = [NSString stringWithFormat:@"参数类型 %@ → 传 NSString", type];
+        return YES;
+    }
+    if ([type hasPrefix:@"@\""]) {
+        if (why) *why = [NSString stringWithFormat:@"参数类型 %@ → 需要该类型的对象实例，v1.2 不硬凑，已阻止", type];
+        return NO;
+    }
+    if (why) *why = [NSString stringWithFormat:@"参数类型 %@ → 非对象类型，已阻止", type];
+    return NO;
+}
+
+#pragma mark - 会话 ID 读取（只读 KVC，全部兜异常）
+
 static NSArray *PJQGChatIdKeyCandidates(void) {
     return @[ @"m_nsChatName", @"m_nsRealChatUsr", @"m_nsChatRoomUserName",
               @"chatUserName", @"m_nsUsrName", @"m_nsToUsr" ];
 }
 
-// 在 VC（以及它的 logicController 等 ivar）里找会话标识
-static NSString *PJQGChatId(id vc) {
+static NSString *PJQGSafeStringForKey(id obj, NSString *key, NSString **hitKey) {
+    if (!obj || key.length == 0) return nil;
+    @try {
+        id v = [obj valueForKey:key];
+        if ([v isKindOfClass:NSString.class] && [v length] > 0) {
+            if (hitKey) *hitKey = key;
+            return v;
+        }
+    } @catch (NSException *e) { }
+    return nil;
+}
+
+static NSString *PJQGChatId(id vc, NSString **how) {
     if (!vc) return nil;
     for (NSString *k in PJQGChatIdKeyCandidates()) {
-        @try {
-            id v = [vc valueForKey:k];
-            if ([v isKindOfClass:NSString.class] && [v length] > 0) {
-                PJQGLog(@"  · 会话ID 命中: %@ = %@", k, v);
-                return v;
-            }
-        } @catch (NSException *e) { /* 忽略 */ }
+        NSString *hit = nil;
+        NSString *v = PJQGSafeStringForKey(vc, k, &hit);
+        if (v) { if (how) *how = hit; return v; }
     }
-    // 再往一层：logicController / logic / m_logicController 等
-    NSArray *holders = @[ @"logicController", @"m_logicController", @"logic",
-                          @"m_logic", @"controller", @"chatController" ];
-    for (NSString *h in holders) {
+    for (NSString *h in @[ @"logicController", @"m_logicController", @"logic",
+                           @"m_logic", @"controller", @"chatController" ]) {
         id child = nil;
         @try { child = [vc valueForKey:h]; } @catch (NSException *e) { continue; }
-        if (!child) continue;
+        if (!child || PJQGIsClassObjectSafely(child)) continue;
         for (NSString *k in PJQGChatIdKeyCandidates()) {
-            @try {
-                id v = [child valueForKey:k];
-                if ([v isKindOfClass:NSString.class] && [v length] > 0) {
-                    PJQGLog(@"  · 会话ID 命中: %@.%@ = %@", h, k, v);
-                    return v;
-                }
-            } @catch (NSException *e) { /* 忽略 */ }
+            NSString *hit = nil;
+            NSString *v = PJQGSafeStringForKey(child, k, &hit);
+            if (v) { if (how) *how = [NSString stringWithFormat:@"%@.%@", h, hit]; return v; }
         }
     }
     return nil;
 }
 
-// 候选单例访问器
-static NSArray *PJQGSingletonGetters(void) {
-    return @[ @"sharedInstance", @"sharedManager", @"defaultManager", @"shared",
-              @"manager", @"defaultInstance", @"instance", @"getInstance",
-              @"sharedModel", @"sharedDataModel", @"currentManager" ];
-}
+#pragma mark - provider 查找（只走"类 / 单例"路径，不做对象图遍历）
 
-// 找一个「响应 sel」的对象：先试 PJ* 单例，再做对象图有界搜索
-static id PJQGFindProvider(SEL sel, id hint, NSString **howFound) {
-    if (!sel) return nil;
+static NSMutableDictionary *gPJQGProviderCache = nil;
+
+static id PJQGFindProvider(SEL sel, NSString **howFound) {
     if (howFound) *howFound = nil;
+    if (!sel) return nil;
+    if (!gPJQGProviderCache) gPJQGProviderCache = [NSMutableDictionary dictionary];
 
-    // ① 类方法/单例
-    for (NSString *cn in PJQGClassesRespondingTo(sel)) {
-        if (![cn hasPrefix:@"PJ"] && ![cn hasPrefix:@"Misaka"] && ![cn hasPrefix:@"MM"]) continue;
+    NSString *key = NSStringFromSelector(sel);
+    id cached = gPJQGProviderCache[key];
+    if (cached) {
+        if (cached == [NSNull null]) return nil;
+        if (howFound) *howFound = @"(缓存)";
+        return cached;
+    }
+
+    for (NSString *cn in PJQGClassesImplementing(sel)) {
+        if (![cn hasPrefix:@"PJ"] && ![cn hasPrefix:@"Misaka"]) continue;
         Class c = NSClassFromString(cn);
         if (!c) continue;
-        // 类方法直接可用
+
         if (class_getClassMethod(c, sel)) {
-            if (howFound) *howFound = [NSString stringWithFormat:@"类方法 %@.%@", cn, NSStringFromSelector(sel)];
+            if (howFound) *howFound = [NSString stringWithFormat:@"类方法 +[%@ %@]", cn, key];
+            gPJQGProviderCache[key] = (id)c;
             return (id)c;
         }
-        for (NSString *g in PJQGSingletonGetters()) {
+        for (NSString *g in @[ @"sharedInstance", @"sharedManager", @"defaultManager", @"shared",
+                               @"manager", @"defaultInstance", @"instance", @"getInstance",
+                               @"sharedModel", @"sharedDataModel", @"currentManager" ]) {
             SEL gs = NSSelectorFromString(g);
             if (![c respondsToSelector:gs]) continue;
             @try {
                 id inst = ((id (*)(id, SEL))objc_msgSend)(c, gs);
-                if (inst && [inst respondsToSelector:sel]) {
-                    if (howFound) *howFound = [NSString stringWithFormat:@"单例 %@.%@", cn, g];
+                if (inst && !PJQGIsClassObjectSafely(inst) && [inst respondsToSelector:sel]) {
+                    if (howFound) *howFound = [NSString stringWithFormat:@"单例 +[%@ %@]", cn, g];
+                    gPJQGProviderCache[key] = inst;
                     return inst;
                 }
-            } @catch (NSException *e) { /* 忽略 */ }
+            } @catch (NSException *e) { }
         }
     }
-
-    // ② 对象图有界搜索
-    int budget = 1500;
-    NSMutableSet *seen = [NSMutableSet set];
-    NSMutableArray *paths = [NSMutableArray array];
-    NSArray *roots = PJQGRootObjects(hint);
-    for (id r in roots) {
-        id found = PJQGGraphFind(sel, r, 4, &budget, seen, paths, NSStringFromClass([r class]));
-        if (found) {
-            if (howFound) *howFound = paths.lastObject ?: NSStringFromClass([found class]);
-            return found;
-        }
-        if (budget <= 0) break;
-    }
+    gPJQGProviderCache[key] = [NSNull null];
     return nil;
 }
 
-// 读方法第 1 个参数的类名（nil 表示无/未知）
-static NSString *PJQGFirstArgClassName(id target, SEL sel) {
-    if (!target || !sel) return nil;
-    Class c = [target class];
-    Method m = NULL;
-    while (c && !m) { m = class_getInstanceMethod(c, sel); c = class_getSuperclass(c); }
-    if (!m) return nil;
-    const char *enc = method_getTypeEncoding(m);
-    if (!enc) return nil;
-    const char *p = strstr(enc, "@\"");
-    if (!p) return nil;
-    p += 2;
-    const char *e = strchr(p, '"');
-    if (!e || e <= p) return nil;
-    return [[NSString alloc] initWithBytes:p length:(NSUInteger)(e - p) encoding:NSUTF8StringEncoding];
+#pragma mark - 实际写入（验签 + 哨兵 + 兜异常）
+
+typedef NS_ENUM(NSInteger, PJQGApplyResult) {
+    PJQGApplyOK = 0,
+    PJQGApplyNoProvider,
+    PJQGApplyBadSignature,
+    PJQGApplyException,
+    PJQGApplySafeMode,
+};
+
+static NSString *PJQGApplyResultText(PJQGApplyResult r, NSString *detail) {
+    switch (r) {
+        case PJQGApplyOK:           return @"已归入";
+        case PJQGApplyNoProvider:   return @"失败：未找到分组接口（长按→接口探测）";
+        case PJQGApplyBadSignature: return [NSString stringWithFormat:@"已阻止调用（%@）", detail ?: @"签名不匹配"];
+        case PJQGApplyException:    return [NSString stringWithFormat:@"调用报错：%@", detail ?: @"未知"];
+        case PJQGApplySafeMode:     return @"安全模式中：已禁用写入";
+    }
+    return @"失败";
 }
 
-// 在对象图里找一个指定类的实例（浅层搜索）
-static id PJQGFindInstanceOfClass(Class want, id hint) {
-    if (!want) return nil;
-    __block id hit = nil;
-    NSArray *roots = PJQGRootObjects(hint);
-    for (id r in roots) {
-        if ([r isKindOfClass:want]) return r;
-        PJQGEnumerateIvars([r class], r, ^(NSString *n, id v) {
-            if (hit) return;
-            if ([v isKindOfClass:want]) hit = v;
-            else if (!PJQGIsLeafObject(v)) {
-                PJQGEnumerateIvars([v class], v, ^(NSString *n2, id v2) {
-                    if (!hit && [v2 isKindOfClass:want]) hit = v2;
-                });
-            }
-        });
-        if (hit) return hit;
-    }
-    return nil;
-}
+static PJQGApplyResult PJQGApply(NSString *chatId, PJQGKind kind, NSString **detail) {
+    if (detail) *detail = nil;
+    if (chatId.length == 0) { if (detail) *detail = @"会话 ID 为空"; return PJQGApplyNoProvider; }
+    if (PJQGSafeMode()) return PJQGApplySafeMode;
 
-// 找出真正实现了 add*Data: 的对象并调用
-static BOOL PJQGApply(NSString *chatId, PJQGKind kind) {
-    if (chatId.length == 0) return NO;
-
-    SEL add = NULL;
-    switch (kind) {
-        case PJQGKindGroup: add = NSSelectorFromString(@"addGroupData:");      break;
-        case PJQGKindChat:  add = NSSelectorFromString(@"addChatData:");       break;
-        case PJQGKindOther: add = NSSelectorFromString(@"addOtherGroupData:"); break;
-    }
-    if (!add) return NO;
+    NSString *selName = PJQGSelectorForKind(kind);
+    SEL add = NSSelectorFromString(selName);
+    PJQGLog(@"[apply] 目标选择子 = %@", selName);
 
     NSString *how = nil;
-    id provider = PJQGFindProvider(add, nil, &how);
-    PJQGLog(@"[apply] %@ → provider=%@  via=%@",
-            NSStringFromSelector(add), provider ? NSStringFromClass([provider class]) : @"(未找到)", how ?: @"-");
-    if (!provider) return NO;
+    id provider = PJQGFindProvider(add, &how);
+    PJQGLog(@"[apply] provider = %@  via %@",
+            provider ? NSStringFromClass([provider class]) : @"(未找到)", how ?: @"-");
+    if (!provider) { if (detail) *detail = @"无 provider"; return PJQGApplyNoProvider; }
 
-    // 参数类型自适应：读 type encoding 判断该传 NSString 还是会话对象
-    NSString *argCls = PJQGFirstArgClassName(provider, add);
-    BOOL wantString = (argCls.length == 0) ||
-                      [argCls isEqualToString:@"NSString"] ||
-                      [argCls isEqualToString:@"NSMutableString"] ||
-                      [argCls isEqualToString:@"NSObject"];
-    id arg = chatId;
-    PJQGLog(@"[apply] 参数类型 = %@ → 传 %@", argCls.length ? argCls : @"(未知)", wantString ? @"NSString" : @"对象");
+    PJQGLog(@"[apply] 签名: %@", PJQGMethodInfo(provider, add));
 
-    if (!wantString) {
-        Class ac = NSClassFromString(argCls);
-        id obj = PJQGFindInstanceOfClass(ac, nil);
-        if (obj) { arg = obj; PJQGLog(@"[apply] 已取得参数对象: %@", NSStringFromClass([obj class])); }
-        else PJQGLog(@"[apply] 未找到 %@ 实例，仍按 NSString 传入", argCls);
+    id arg = nil;
+    NSString *why = nil;
+    if (!PJQGSignatureAllows(provider, add, chatId, &arg, &why)) {
+        PJQGLog(@"[apply] 验签未通过 → 不调用。原因: %@", why ?: @"?");
+        if (detail) *detail = why;
+        return PJQGApplyBadSignature;
     }
+    PJQGLog(@"[apply] 验签通过: %@", why ?: @"ok");
 
     BOOL ok = NO;
+    PJQGRiskyBegin("addData");
     @try {
         ((void (*)(id, SEL, id))objc_msgSend)(provider, add, arg);
         ok = YES;
+    } @catch (NSException *e) {
+        PJQGLog(@"[apply] 抛异常: %@", e.reason);
+        if (detail) *detail = e.reason;
     }
-    @catch (NSException *e) {
-        PJQGLog(@"[apply] 调用 %@ 抛异常: %@", NSStringFromSelector(add), e.reason);
-    }
+    PJQGRiskyEnd();
 
-    // 兜底：统一的 selectChat 动作
-    if (!ok) {
-        SEL sel2 = NSSelectorFromString(@"misaka_selectChatAction");
-        if ([provider respondsToSelector:sel2]) {
-            @try { ((void (*)(id, SEL))objc_msgSend)(provider, sel2); ok = YES; }
-            @catch (NSException *e) { /* 忽略 */ }
-        }
-    }
+    if (!ok) return PJQGApplyException;
 
-    // 刷新主界面分栏
+    // 刷新主界面分栏：只有 0 入参签名才调
     SEL rebuild = NSSelectorFromString(@"rebuildMainSessions");
     NSString *how2 = nil;
-    id rb = PJQGFindProvider(rebuild, nil, &how2);
+    id rb = PJQGFindProvider(rebuild, &how2);
     if (rb) {
-        @try { ((void (*)(id, SEL))objc_msgSend)(rb, rebuild); PJQGLog(@"[apply] rebuildMainSessions via %@", how2 ?: @"-"); }
-        @catch (NSException *e) { /* 忽略 */ }
+        NSString *why2 = nil;
+        if (PJQGSignatureAllows0(rb, rebuild, &why2)) {
+            PJQGLog(@"[apply] 刷新签名 OK: %@", why2 ?: @"");
+            PJQGRiskyBegin("rebuildMainSessions");
+            @try { ((void (*)(id, SEL))objc_msgSend)(rb, rebuild); PJQGLog(@"[apply] 已刷新 via %@", how2 ?: @"-"); }
+            @catch (NSException *e) { PJQGLog(@"[apply] 刷新异常: %@", e.reason); }
+            PJQGRiskyEnd();
+        } else {
+            PJQGLog(@"[apply] 刷新方法签名不允许调用: %@", why2 ?: @"?");
+        }
     } else {
         PJQGLog(@"[apply] 未找到 rebuildMainSessions");
     }
-    return ok;
+    return PJQGApplyOK;
 }
 
 #pragma mark - 诊断报告
@@ -501,8 +623,9 @@ static NSString *PJQGDeviceName(void) {
 }
 
 static NSString *PJQGDiagnose(id chatVC) {
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     NSMutableString *s = [NSMutableString string];
-    [s appendFormat:@"MikotoQuickGroup 诊断报告 v1.1\n"];
+    [s appendFormat:@"MikotoQuickGroup 诊断报告 v1.2\n"];
     [s appendFormat:@"时间     : %@\n", [NSDate date]];
     [s appendFormat:@"设备     : %@\n", PJQGDeviceName()];
     [s appendFormat:@"PID      : %d\n", getpid()];
@@ -511,63 +634,81 @@ static NSString *PJQGDiagnose(id chatVC) {
         [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?",
         [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?"];
     [s appendFormat:@"日志文件 : %@\n", PJQGLogPath()];
+    [s appendFormat:@"安全模式 : %@\n", PJQGSafeMode() ? @"开启" : @"关闭"];
+    [s appendFormat:@"上次崩溃点: %@\n", [ud objectForKey:kPJQGRiskyFlagKey] ?: @"(无)"];
 
     [s appendString:@"\n--- MikotoHelper 是否已加载 ---\n"];
-    NSArray *probe = @[ @"PJGroupDataModel", @"PJMisakaManager", @"PJGroupManager",
-                        @"PJManagerModel", @"PJHelper", @"PJPluginModel" ];
-    for (NSString *cn in probe) {
+    for (NSString *cn in @[ @"PJGroupDataModel", @"PJMisakaManager", @"PJGroupManager",
+                            @"PJManagerModel", @"PJHelper", @"PJPluginModel" ]) {
         [s appendFormat:@"  %-20s %@\n", cn.UTF8String, NSClassFromString(cn) ? @"✓ 存在" : @"✗ 不存在"];
     }
 
-    [s appendString:@"\n--- 谁实现了分组方法 ---\n"];
-    NSArray *sels = @[ @"addGroupData:", @"addChatData:", @"addOtherGroupData:",
-                       @"misaka_selectChatAction", @"rebuildMainSessions",
-                       @"chatIsChatAction:", @"groupIsChatAction:" ];
-    for (NSString *sn in sels) {
-        NSArray *cls = PJQGClassesRespondingTo(NSSelectorFromString(sn));
+    [s appendString:@"\n--- 谁实现了这些方法 ---\n"];
+    for (NSString *sn in @[ @"addGroupData:", @"addChatData:", @"addOtherGroupData:",
+                            @"misaka_selectChatAction", @"rebuildMainSessions",
+                            @"chatIsChatAction:", @"groupIsChatAction:" ]) {
+        NSArray *cls = PJQGClassesImplementing(NSSelectorFromString(sn));
         [s appendFormat:@"  %-24s [%lu] %@\n", sn.UTF8String, (unsigned long)cls.count,
             cls.count ? [cls componentsJoinedByString:@", "] : @"(无)"];
     }
 
-    [s appendString:@"\n--- PJ* 类总量 ---\n"];
-    NSArray *pj = PJQGAllClassNamesWithPrefix(@"PJ");
-    [s appendFormat:@"  PJ* 类 %lu 个\n", (unsigned long)pj.count];
-    NSArray *pjg = PJQGAllClassNamesWithPrefix(@"PJGroup");
-    if (pjg.count) [s appendFormat:@"  PJGroup*: %@\n", [pjg componentsJoinedByString:@", "]];
-    NSArray *pjm = PJQGAllClassNamesWithPrefix(@"PJMisaka");
-    if (pjm.count) [s appendFormat:@"  PJMisaka*: %@\n", [pjm componentsJoinedByString:@", "]];
+    [s appendString:@"\n--- 方法签名（决定能不能调用） ---\n"];
+    for (NSString *sn in @[ @"addGroupData:", @"addChatData:", @"addOtherGroupData:",
+                            @"misaka_selectChatAction", @"rebuildMainSessions" ]) {
+        SEL sel = NSSelectorFromString(sn);
+        NSArray *cls = PJQGClassesImplementing(sel);
+        [s appendFormat:@"  · %@ (%lu 个类)\n", sn, (unsigned long)cls.count];
+        if (cls.count == 0) { [s appendString:@"      (无类实现)\n"]; continue; }
+        int shown = 0;
+        for (NSString *cn in cls) {
+            if (cls.count > 6 && ![cn hasPrefix:@"PJ"] && ![cn hasPrefix:@"Misaka"]) continue;
+            Class c = NSClassFromString(cn);
+            [s appendFormat:@"      %@\n", PJQGMethodInfo((id)c, sel)];
+            [s appendFormat:@"      %@\n", PJQGMethodInfo(c, sel)];
+            if (++shown >= 8) { [s appendString:@"      ...(截断)\n"]; break; }
+        }
+    }
+
+    [s appendString:@"\n--- provider 解析 ---\n"];
+    for (NSString *sn in @[ @"addGroupData:", @"addChatData:", @"addOtherGroupData:", @"rebuildMainSessions" ]) {
+        NSString *how = nil;
+        id p = PJQGFindProvider(NSSelectorFromString(sn), &how);
+        [s appendFormat:@"  %-24s %@  via %@\n", sn.UTF8String,
+            p ? NSStringFromClass([p class]) : @"(未找到)", how ?: @"-"];
+    }
+
+    [s appendString:@"\n--- PJ* 类清单 ---\n"];
+    NSArray *pj = PJQGClassNamesWithPrefix(@"PJ");
+    [s appendFormat:@"  PJ* 共 %lu 个\n", (unsigned long)pj.count];
+    for (NSString *prefix in @[ @"PJGroup", @"PJMisaka", @"PJTag", @"PJHelper", @"PJUtils" ]) {
+        NSMutableArray *hit = [NSMutableArray array];
+        for (NSString *n in pj) if ([n hasPrefix:prefix]) [hit addObject:n];
+        if (hit.count) [s appendFormat:@"  %@: %@\n", prefix, [hit componentsJoinedByString:@", "]];
+    }
 
     [s appendString:@"\n--- 当前聊天窗口 ---\n"];
     if (chatVC) {
         [s appendFormat:@"  类名: %@\n", NSStringFromClass([chatVC class])];
-        NSString *cid = PJQGChatId(chatVC);
-        [s appendFormat:@"  会话ID: %@\n", cid ?: @"(未取到)"];
+        NSString *how = nil;
+        NSString *cid = PJQGChatId(chatVC, &how);
+        [s appendFormat:@"  会话ID: %@  (字段 %@)\n", cid ?: @"(未取到)", how ?: @"-"];
     } else {
         [s appendString:@"  (尚未进入聊天窗口)\n"];
     }
 
-    [s appendString:@"\n--- 对象图查找结果 ---\n"];
-    NSString *how = nil;
-    id p1 = PJQGFindProvider(NSSelectorFromString(@"addGroupData:"), chatVC, &how);
-    [s appendFormat:@"  addGroupData:        %@  via %@\n", p1 ? NSStringFromClass([p1 class]) : @"(未找到)", how ?: @"-"];
-    how = nil;
-    id p2 = PJQGFindProvider(NSSelectorFromString(@"rebuildMainSessions"), chatVC, &how);
-    [s appendFormat:@"  rebuildMainSessions: %@  via %@\n", p2 ? NSStringFromClass([p2 class]) : @"(未找到)", how ?: @"-"];
-
     [s appendString:@"\n--- NSUserDefaults 相关键 ---\n"];
-    NSDictionary *d = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
     int shown = 0;
+    NSDictionary *d = ud.dictionaryRepresentation;
     for (NSString *k in d.allKeys) {
         NSString *lk = k.lowercaseString;
         if ([lk containsString:@"pj"] || [lk containsString:@"mikoto"] ||
             [lk containsString:@"group"] || [lk containsString:@"misaka"] ||
-            [lk hasPrefix:@"wx"] || [lk containsString:@"hongbao"]) {
+            [lk hasPrefix:@"wx"]) {
             [s appendFormat:@"  %@ = %@\n", k, d[k]];
             if (++shown >= 40) { [s appendString:@"  ...(截断)\n"]; break; }
         }
     }
     if (shown == 0) [s appendString:@"  (无匹配键)\n"];
-
     return s;
 }
 
@@ -596,29 +737,33 @@ static NSString *PJQGDiagnose(id chatVC) {
 }
 
 - (void)install {
-    UIViewController *vc = self.host;
-    if (!vc || !vc.isViewLoaded) return;
+    @try {
+        UIViewController *vc = self.host;
+        if (!vc || !vc.isViewLoaded) return;
 
-    [self installNavButton:vc];
-    [self installBubble:vc];
-    [self refreshTitle];
+        [self installNavButton:vc];
+        [self installBubble:vc];
+        [self refreshTitle];
 
-    if (!self.diagnosed) {
-        self.diagnosed = YES;
-        PJQGLog(@"=== 命中聊天窗口: %@ ===", NSStringFromClass([vc class]));
-        // 诊断放到稍后执行，避免和界面装配抢主线程
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            NSString *rep = PJQGDiagnose(self.host);
-            PJQGLog(@"%@", rep);
-        });
+        if (!self.diagnosed) {
+            self.diagnosed = YES;
+            PJQGLog(@"=== 命中聊天窗口: %@ ===", NSStringFromClass([vc class]));
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @try { PJQGLog(@"%@", PJQGDiagnose(self.host)); }
+                @catch (NSException *e) { PJQGLog(@"[诊断] 生成报告失败: %@", e.reason); }
+            });
+        }
+    } @catch (NSException *e) {
+        PJQGLog(@"[install] 异常: %@", e.reason);
     }
 }
 
 - (void)installNavButton:(UIViewController *)vc {
     if (!vc.navigationItem) return;
+    UINavigationItem *ni = vc.navigationItem;
 
-    for (UIBarButtonItem *it in vc.navigationItem.rightBarButtonItems ?: @[]) {
+    for (UIBarButtonItem *it in ni.rightBarButtonItems ?: @[]) {
         if (it.customView && [it.customView isKindOfClass:UIButton.class] &&
             [it.customView.accessibilityIdentifier isEqualToString:@"pjqg_button"]) {
             self.navButton = (UIButton *)it.customView;
@@ -629,8 +774,10 @@ static NSString *PJQGDiagnose(id chatVC) {
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
     btn.accessibilityIdentifier = @"pjqg_button";
     btn.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+    [btn setTitle:@"分组" forState:UIControlStateNormal];
     [btn addTarget:self action:@selector(onTap:) forControlEvents:UIControlEventTouchUpInside];
     [btn sizeToFit];
+
     UILongPressGestureRecognizer *lp =
         [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onLongPress:)];
     lp.minimumPressDuration = 0.45;
@@ -638,24 +785,25 @@ static NSString *PJQGDiagnose(id chatVC) {
 
     self.navButton = btn;
     UIBarButtonItem *item = [[UIBarButtonItem alloc] initWithCustomView:btn];
-    NSMutableArray *items = [NSMutableArray arrayWithArray:vc.navigationItem.rightBarButtonItems ?: @[]];
+    NSMutableArray *items = [NSMutableArray arrayWithArray:ni.rightBarButtonItems ?: @[]];
     [items insertObject:item atIndex:0];
-    vc.navigationItem.rightBarButtonItems = items;
-    PJQGLog(@"  · 导航栏按钮已插入 (%@)", NSStringFromClass([vc class]));
+    ni.rightBarButtonItems = items;
+    PJQGLog(@"  · 导航栏按钮已插入");
 }
 
 - (void)installBubble:(UIViewController *)vc {
     if (!PJQGBubbleVisible()) {
-        [self.bubble removeFromSuperview];
+        UIButton *old = objc_getAssociatedObject(vc, kPJQGBubbleKey);
+        [old removeFromSuperview];
+        objc_setAssociatedObject(vc, kPJQGBubbleKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         self.bubble = nil;
         return;
     }
-    if (objc_getAssociatedObject(vc, kPJQGBubbleKey)) {
-        self.bubble = objc_getAssociatedObject(vc, kPJQGBubbleKey);
-        return;
-    }
     UIView *hostView = vc.view;
-    if (!hostView) return;
+    if (!hostView || !hostView.window) return;   // 等视图真正上屏再挂，位置才准
+
+    UIButton *exist = objc_getAssociatedObject(vc, kPJQGBubbleKey);
+    if (exist) { self.bubble = exist; return; }
 
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     b.accessibilityIdentifier = @"pjqg_bubble";
@@ -665,8 +813,8 @@ static NSString *PJQGDiagnose(id chatVC) {
     b.layer.cornerRadius = 20;
     b.clipsToBounds = YES;
     [b setTitle:@"分组" forState:UIControlStateNormal];
-    CGSize sz = [b sizeThatFits:CGSizeMake(200, 40)];
-    CGFloat w = MAX(52, sz.width + 22), h = 40;
+
+    CGFloat w = 62, h = 40;
     CGFloat top = 110;
     if (@available(iOS 11.0, *)) top = hostView.safeAreaInsets.top + 70;
     b.frame = CGRectMake(hostView.bounds.size.width - w - 8, top, w, h);
@@ -682,10 +830,9 @@ static NSString *PJQGDiagnose(id chatVC) {
     [b addGestureRecognizer:pan];
 
     [hostView addSubview:b];
-    [hostView bringSubviewToFront:b];
     self.bubble = b;
     objc_setAssociatedObject(vc, kPJQGBubbleKey, b, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    PJQGLog(@"  · 悬浮球已创建 (%@)", NSStringFromClass([vc class]));
+    PJQGLog(@"  · 悬浮球已创建");
 }
 
 - (void)refreshTitle {
@@ -695,51 +842,69 @@ static NSString *PJQGDiagnose(id chatVC) {
 
     [self.navButton setTitle:longT forState:UIControlStateNormal];
     [self.navButton sizeToFit];
-
-    if (self.bubble) {
-        [self.bubble setTitle:shortT forState:UIControlStateNormal];
-    }
+    if (self.bubble) [self.bubble setTitle:shortT forState:UIControlStateNormal];
 }
 
 #pragma mark 交互
 
 - (void)onTap:(UIButton *)sender {
-    NSInteger d = PJQGDefaultKind();
-    if (d < 0) { [self presentPickerSetDefault:YES]; return; }
+    @try {
+        PJQGLog(@"[tap] 单击，默认分组=%ld", (long)PJQGDefaultKind());
+        NSInteger d = PJQGDefaultKind();
+        if (d < 0) { [self presentPickerSetDefault:YES]; return; }
 
-    UIViewController *vc = self.host;
-    NSString *chatId = PJQGChatId(vc);
-    if (chatId.length == 0) { PJQGToast(vc.view, @"未能识别当前会话（见诊断报告）"); return; }
+        UIViewController *vc = self.host;
+        if (!vc) return;
+        NSString *how = nil;
+        NSString *chatId = PJQGChatId(vc, &how);
+        PJQGLog(@"[tap] 会话ID=%@ (字段 %@)", chatId ?: @"(空)", how ?: @"-");
+        if (chatId.length == 0) { PJQGToast(vc.view, @"未能识别当前会话（见诊断报告）"); return; }
 
-    BOOL ok = PJQGApply(chatId, (PJQGKind)d);
-    PJQGToast(vc.view, ok
-              ? [NSString stringWithFormat:@"已归入：%@（默认）", PJQGKindName((PJQGKind)d)]
-              : @"失败：未找到分组接口，请长按按钮看诊断报告");
+        NSString *detail = nil;
+        PJQGApplyResult r = PJQGApply(chatId, (PJQGKind)d, &detail);
+        if (r == PJQGApplyOK) {
+            PJQGToast(vc.view, [NSString stringWithFormat:@"已归入：%@（默认）", PJQGKindName((PJQGKind)d)]);
+        } else {
+            PJQGToast(vc.view, PJQGApplyResultText(r, detail));
+        }
+    } @catch (NSException *e) {
+        PJQGLog(@"[tap] 异常: %@", e.reason);
+    }
 }
 
 - (void)onLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
-    [self presentMenu];
+    @try { [self presentMenu]; } @catch (NSException *e) { PJQGLog(@"[menu] 异常: %@", e.reason); }
 }
 
 - (void)onPan:(UIPanGestureRecognizer *)g {
-    UIView *b = g.view;
-    UIView *p = b.superview;
-    if (!b || !p) return;
-    CGPoint t = [g translationInView:p];
-    CGPoint c = CGPointMake(b.center.x + t.x, b.center.y + t.y);
-    CGFloat halfW = b.bounds.size.width / 2, halfH = b.bounds.size.height / 2;
-    c.x = MIN(MAX(c.x, halfW + 4), p.bounds.size.width - halfW - 4);
-    c.y = MIN(MAX(c.y, halfH + 44), p.bounds.size.height - halfH - 44);
-    b.center = c;
-    [g setTranslation:CGPointZero inView:p];
+    @try {
+        UIView *b = g.view;
+        UIView *p = b.superview;
+        if (!b || !p) return;
+        CGPoint t = [g translationInView:p];
+        CGPoint c = CGPointMake(b.center.x + t.x, b.center.y + t.y);
+        CGFloat halfW = b.bounds.size.width / 2, halfH = b.bounds.size.height / 2;
+        c.x = MIN(MAX(c.x, halfW + 4), p.bounds.size.width - halfW - 4);
+        c.y = MIN(MAX(c.y, halfH + 44), p.bounds.size.height - halfH - 44);
+        b.center = c;
+        [g setTranslation:CGPointZero inView:p];
+    } @catch (NSException *e) { }
 }
 
 #pragma mark 菜单与选择器
 
-- (void)presentMenu {
+- (UIViewController *)topmost {
     UIViewController *vc = self.host;
-    if (!vc) return;
+    int guard = 0;
+    while (vc.presentedViewController && guard++ < 8) vc = vc.presentedViewController;
+    return vc;
+}
+
+- (void)presentMenu {
+    UIViewController *vc = [self topmost];
+    if (!vc || vc.isBeingDismissed) return;
+
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"快速分组"
                                 message:nil
                                 preferredStyle:UIAlertControllerStyleActionSheet];
@@ -764,9 +929,17 @@ static NSString *PJQGDiagnose(id chatVC) {
         }]];
     }
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"查看诊断报告"
+    [sheet addAction:[UIAlertAction actionWithTitle:@"接口探测（只读，不写入）"
                         style:UIAlertActionStyleDefault
                         handler:^(UIAlertAction *a) { [self showDiagnose]; }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:
+        (PJQGSafeMode() ? @"解除安全模式（允许写入）" : @"进入安全模式（禁用写入）")
+        style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *a) {
+        PJQGSetSafeMode(!PJQGSafeMode());
+        PJQGToast(self.host.view, PJQGSafeMode() ? @"已进入安全模式" : @"已解除安全模式");
+    }]];
 
     [sheet addAction:[UIAlertAction actionWithTitle:
                         (PJQGBubbleVisible() ? @"隐藏悬浮球" : @"显示悬浮球")
@@ -785,11 +958,12 @@ static NSString *PJQGDiagnose(id chatVC) {
 }
 
 - (void)presentPickerSetDefault:(BOOL)setDefault {
-    UIViewController *vc = self.host;
-    if (!vc) return;
+    UIViewController *vc = [self topmost];
+    if (!vc || vc.isBeingDismissed) return;
+
     NSString *title = setDefault ? @"选择默认分组" : @"本次归入";
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:title
-                                message:setDefault ? @"选择后成为默认分组，之后单击按钮即直接归入" : nil
+                                message:setDefault ? @"选择后成为默认分组，之后单击即直接归入" : nil
                                 preferredStyle:UIAlertControllerStyleActionSheet];
 
     for (NSInteger k = PJQGKindGroup; k <= PJQGKindOther; k++) {
@@ -797,13 +971,24 @@ static NSString *PJQGDiagnose(id chatVC) {
         [sheet addAction:[UIAlertAction actionWithTitle:name
                             style:UIAlertActionStyleDefault
                             handler:^(UIAlertAction *a) {
-            if (setDefault) { PJQGSetDefaultKind(k); [self refreshTitle]; }
-            NSString *chatId = PJQGChatId(self.host);
-            if (chatId.length == 0) { PJQGToast(self.host.view, @"未能识别当前会话（见诊断报告）"); return; }
-            BOOL ok = PJQGApply(chatId, (PJQGKind)k);
-            PJQGToast(self.host.view, ok
-                      ? [NSString stringWithFormat:@"已归入：%@%@", name, setDefault ? @"（已设为默认）" : @""]
-                      : @"失败：未找到分组接口，请长按按钮看诊断报告");
+            @try {
+                if (setDefault) { PJQGSetDefaultKind(k); [self refreshTitle]; }
+                UIViewController *host = self.host;
+                if (!host) return;
+                NSString *how = nil;
+                NSString *chatId = PJQGChatId(host, &how);
+                if (chatId.length == 0) { PJQGToast(host.view, @"未能识别当前会话（见诊断报告）"); return; }
+                NSString *detail = nil;
+                PJQGApplyResult r = PJQGApply(chatId, (PJQGKind)k, &detail);
+                if (r == PJQGApplyOK) {
+                    PJQGToast(host.view, [NSString stringWithFormat:@"已归入：%@%@",
+                                          name, setDefault ? @"（已设为默认）" : @""]);
+                } else {
+                    PJQGToast(host.view, PJQGApplyResultText(r, detail));
+                }
+            } @catch (NSException *e) {
+                PJQGLog(@"[picker] 异常: %@", e.reason);
+            }
         }]];
     }
 
@@ -814,11 +999,17 @@ static NSString *PJQGDiagnose(id chatVC) {
 }
 
 - (void)showDiagnose {
-    NSString *rep = PJQGDiagnose(self.host);
-    PJQGLog(@"%@", rep);
+    NSString *rep = nil;
+    @try { rep = PJQGDiagnose(self.host); }
+    @catch (NSException *e) { rep = [NSString stringWithFormat:@"生成失败: %@", e.reason]; }
+    PJQGLog(@"%@", rep ?: @"(空)");
 
-    UIAlertController *al = [UIAlertController alertControllerWithTitle:@"诊断报告"
-                             message:[rep substringToIndex:MIN((NSUInteger)1400, rep.length)]
+    UIViewController *vc = [self topmost];
+    if (!vc) return;
+
+    NSString *body = rep.length > 1500 ? [rep substringToIndex:1500] : rep;
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:@"接口探测（只读）"
+                             message:body
                              preferredStyle:UIAlertControllerStyleAlert];
     [al addAction:[UIAlertAction actionWithTitle:@"复制全文"
                         style:UIAlertActionStyleDefault
@@ -827,12 +1018,18 @@ static NSString *PJQGDiagnose(id chatVC) {
         PJQGToast(self.host.view, @"已复制，可直接粘贴发送");
     }]];
     [al addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
-    [self.host presentViewController:al animated:YES completion:nil];
+    [vc presentViewController:al animated:YES completion:nil];
 }
 
 - (void)anchorPopover:(UIAlertController *)sheet {
-    sheet.popoverPresentationController.sourceView = self.navButton ?: self.bubble ?: self.host.view;
-    sheet.popoverPresentationController.sourceRect = (self.navButton ?: self.bubble).bounds;
+    @try {
+        UIPopoverPresentationController *pop = sheet.popoverPresentationController;
+        if (!pop) return;
+        UIView *src = self.bubble ?: self.navButton ?: self.host.view;
+        if (!src) return;
+        pop.sourceView = src;
+        pop.sourceRect = src.bounds;
+    } @catch (NSException *e) { }
 }
 
 @end
@@ -852,17 +1049,19 @@ static BOOL PJQGIsChatVC(id vc) {
     if (cached) return cached.boolValue;
 
     BOOL ok = NO;
-    if ([n containsString:@"MainFrame"] || [n containsString:@"NavigationController"] ||
-        [n containsString:@"TabBar"] || [n containsString:@"Window"] ||
-        [n containsString:@"Alert"] || [n containsString:@"PJQG"]) {
-        ok = NO;
-    } else if ([n containsString:@"MsgContent"] || [n containsString:@"ChatViewController"] ||
-               [n containsString:@"ChatRoomViewController"] || [n containsString:@"SessionViewController"]) {
-        ok = YES;
-    } else if ([vc respondsToSelector:NSSelectorFromString(@"m_nsChatName")] ||
-               [vc respondsToSelector:NSSelectorFromString(@"m_nsChatRoomUserName")]) {
-        ok = YES;
-    }
+    @try {
+        if ([n containsString:@"MainFrame"] || [n containsString:@"NavigationController"] ||
+            [n containsString:@"TabBar"] || [n containsString:@"Window"] ||
+            [n containsString:@"Alert"] || [n containsString:@"PJQG"]) {
+            ok = NO;
+        } else if ([n containsString:@"MsgContent"] || [n containsString:@"ChatViewController"] ||
+                   [n containsString:@"ChatRoomViewController"] || [n containsString:@"SessionViewController"]) {
+            ok = YES;
+        } else if ([vc respondsToSelector:NSSelectorFromString(@"m_nsChatName")] ||
+                   [vc respondsToSelector:NSSelectorFromString(@"m_nsChatRoomUserName")]) {
+            ok = YES;
+        }
+    } @catch (NSException *e) { ok = NO; }
 
     gPJQGClassMatch[n] = @(ok);
     if (ok) PJQGLog(@"[匹配] 聊天窗口类 = %@", n);
@@ -887,48 +1086,95 @@ static BOOL PJQGIsChatVC(id vc) {
 
 #pragma mark - 载入自证
 
+static void PJQGShowLaunchAlert(void) {
+    BOOL misaka = (NSClassFromString(@"PJGroupDataModel") || NSClassFromString(@"PJMisakaManager"));
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    NSString *risky = [ud objectForKey:kPJQGRiskyFlagKey];
+
+    PJQGLog(@"[自检] MikotoHelper=%@ 默认=%ld 悬浮球=%@ 安全模式=%@",
+            misaka ? @"✓" : @"✗", (long)PJQGDefaultKind(),
+            PJQGBubbleVisible() ? @"显示" : @"隐藏", PJQGSafeMode() ? @"开" : @"关");
+
+    if (risky.length > 0) {
+        PJQGLog(@"!!! 上次运行崩溃于: %@ → 自动进入安全模式", risky);
+        [ud removeObjectForKey:kPJQGRiskyFlagKey];
+        [ud synchronize];
+        PJQGSetSafeMode(YES);
+    }
+
+    UIWindow *kw = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (w.isKeyWindow) { kw = w; break; }
+    }
+    if (!kw) kw = UIApplication.sharedApplication.windows.firstObject;
+    UIViewController *host = kw.rootViewController;
+    int guard = 0;
+    while (host.presentedViewController && guard++ < 8) host = host.presentedViewController;
+    if (!host || host.isBeingDismissed) return;
+
+    NSString *title = @"MikotoQuickGroup 已加载 ✓";
+    NSString *msg;
+    if (risky.length > 0) {
+        title = @"⚠️ 上次运行发生过崩溃";
+        msg = [NSString stringWithFormat:
+               @"上次崩溃发生在：\n%@\n\n"
+                "已自动进入安全模式（不会再调用该接口，所以不会再闪退）。\n\n"
+                "崩溃调用栈已写入：\n%@\n\n"
+                "请把该日志文件发给我。",
+               risky, PJQGLogPath()];
+    } else if (!misaka) {
+        msg = [NSString stringWithFormat:
+               @"插件已加载，但没检测到 MikotoHelper 的分组模块。\n"
+                "请确认 MikotoHelper 也在运行。\n\n日志：%@", PJQGLogPath()];
+    } else {
+        msg = [NSString stringWithFormat:
+               @"插件已被微信加载。\n\n"
+                "进入任意聊天窗口：右侧有可拖动的「分组」悬浮球，右上角有「分组」按钮。\n"
+                "单击 = 归入默认分组；长按 = 菜单（含「接口探测」「安全模式」）。\n\n"
+                "日志：%@", PJQGLogPath()];
+    }
+
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:title
+                             message:msg preferredStyle:UIAlertControllerStyleAlert];
+    [al addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
+    [al addAction:[UIAlertAction actionWithTitle:@"不再提示" style:UIAlertActionStyleDefault
+                        handler:^(UIAlertAction *a) {
+        [ud setBool:YES forKey:kPJQGSilentKey];
+        [ud synchronize];
+    }]];
+    @try { [host presentViewController:al animated:YES completion:nil]; } @catch (NSException *e) { }
+}
+
 %ctor {
-    // 注意：构造函数里只做"轻量"操作（不碰 NSUserDefaults），避免早期初始化死锁
+    // 构造函数里只做轻量操作（不碰 NSUserDefaults），避免早期初始化死锁
     PJQGLog(@"================================================");
-    PJQGLog(@"MikotoQuickGroup v1.1 已注入 (pid=%d)", getpid());
+    PJQGLog(@"MikotoQuickGroup v1.2 已注入 (pid=%d)", getpid());
     PJQGLog(@"bundle = %@", NSBundle.mainBundle.bundleIdentifier ?: @"?");
     PJQGLog(@"MikotoHelper(Misaka) = %@",
             (NSClassFromString(@"PJGroupDataModel") || NSClassFromString(@"PJMisakaManager"))
-                ? @"✓ 已检测到" : @"✗ 未检测到（MikotoHelper 可能未加载）");
+                ? @"✓ 已检测到" : @"✗ 未检测到");
     PJQGLog(@"日志文件 = %@", PJQGLogPath());
-    PJQGLog(@"  · 若可在 Filza 中打开该文件，说明 dylib 确实被加载了");
     PJQGLog(@"================================================");
 
-    // 4 秒后弹窗自证：能弹出来 = dylib 确实被加载了
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try { PJQGInstallCrashHandlers(); PJQGLog(@"[自检] 崩溃取证已启用"); }
+        @catch (NSException *e) { }
+    });
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        BOOL misaka = (NSClassFromString(@"PJGroupDataModel") || NSClassFromString(@"PJMisakaManager"));
-        PJQGLog(@"[自检] 默认分组 = %ld, 悬浮球 = %@, MikotoHelper = %@",
-                (long)PJQGDefaultKind(), PJQGBubbleVisible() ? @"显示" : @"隐藏",
-                misaka ? @"✓" : @"✗");
-
-        if ([[NSUserDefaults standardUserDefaults] boolForKey:kPJQGSilentKey]) return;
-        UIWindow *kw = nil;
-        for (UIWindow *w in UIApplication.sharedApplication.windows) {
-            if (w.isKeyWindow) { kw = w; break; }
+        @try {
+            NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+            BOOL silent = [ud boolForKey:kPJQGSilentKey];
+            BOOL risky = ([ud objectForKey:kPJQGRiskyFlagKey] != nil);
+            if (silent && !risky) {
+                PJQGLog(@"[自检] 用户已关闭启动提示");
+            } else {
+                PJQGShowLaunchAlert();
+            }
+        } @catch (NSException *e) {
+            PJQGLog(@"[自检] 弹窗失败: %@", e.reason);
         }
-        UIViewController *host = kw.rootViewController;
-        if (!host) return;
-        UIAlertController *al = [UIAlertController
-            alertControllerWithTitle:@"MikotoQuickGroup 已加载 ✓"
-            message:[NSString stringWithFormat:
-                @"插件已被微信加载，功能正在生效。\n\n"
-                 "进入任意聊天窗口：右上角会出现「分组」按钮，另有一个可拖动的悬浮球（悬浮球一定能看到）。\n\n"
-                 "MikotoHelper 分组模块：%@\n日志：%@",
-                misaka ? @"✓ 已检测到" : @"✗ 未检测到",
-                PJQGLogPath()]
-            preferredStyle:UIAlertControllerStyleAlert];
-        [al addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
-        [al addAction:[UIAlertAction actionWithTitle:@"不再提示" style:UIAlertActionStyleDefault
-                            handler:^(UIAlertAction *a) {
-            [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kPJQGSilentKey];
-            [[NSUserDefaults standardUserDefaults] synchronize];
-        }]];
-        [host presentViewController:al animated:YES completion:nil];
     });
 }

@@ -46,7 +46,7 @@
 
 #pragma mark - 常量
 
-static NSString *const kPJQGVersion          = @"1.3";
+static NSString *const kPJQGVersion          = @"1.4";
 static NSString *const kPJQGDefaultKindKey   = @"pjqg_default_kind";   // NSInteger, -1 = 未设置
 static NSString *const kPJQGBubbleVisibleKey = @"pjqg_bubble_visible";
 static NSString *const kPJQGSilentKey        = @"pjqg_silent_alert";
@@ -613,15 +613,51 @@ static int PJQGLooksLikeChatIdScore(NSString *s) {
     return sc;
 }
 
-static NSString *PJQGSafeStringForKey(id obj, NSString *key, NSString **hitKey) {
+// 绝对安全的取值：为什么不直接用 KVC？
+// 微信的 protobuf 基类把 -valueForUndefinedKey: 重写成了直接抛异常，
+// 抛出来的信息就是 "Property Name should be baseResponse" 这类断言文本。
+// 只要 KVC 取一个不存在的键，就会炸。所以这里：
+//   ① 先查成员变量 → 有就直接 object_getIvar（完全绕过 KVC）
+//   ② 只有确认类真的实现了返回对象的 getter，才走 valueForKey:
+//   ③ 全过程包 @try（respondsToSelector: 会触发 +initialize，同样可能抛）
+static id PJQGSafeObjectForKey(id obj, NSString *key) {
     if (!obj || key.length == 0) return nil;
+    if (PJQGIsClassObjectSafely(obj)) return nil;
     @try {
-        id v = [obj valueForKey:key];
-        if ([v isKindOfClass:NSString.class] && [v length] > 0) {
-            if (hitKey) *hitKey = key;
-            return v;
+        const char *kn = key.UTF8String;
+        if (!kn) return nil;
+
+        // ① 成员变量直读（class_getInstanceVariable 会自动沿继承链查找）
+        Ivar iv = class_getInstanceVariable([obj class], kn);
+        if (iv) {
+            const char *te = ivar_getTypeEncoding(iv);
+            if (!te || te[0] != '@') return nil;     // 标量成员不走这条路
+            return object_getIvar(obj, iv);
         }
-    } @catch (NSException *e) { }
+
+        // ② 确认真的有这个方法，且返回的是对象，才敢 KVC
+        SEL g = NSSelectorFromString(key);
+        if (!g) return nil;
+        Method m = class_getInstanceMethod([obj class], g);
+        if (!m) return nil;
+        char rt[8] = {0};
+        method_getReturnType(m, rt, sizeof(rt));
+        if (rt[0] != '@') return nil;
+        if (![obj respondsToSelector:g]) return nil;
+        return [obj valueForKey:key];
+    } @catch (NSException *e) {
+        return nil;
+    } @catch (...) {
+        return nil;
+    }
+}
+
+static NSString *PJQGSafeStringForKey(id obj, NSString *key, NSString **hitKey) {
+    id v = PJQGSafeObjectForKey(obj, key);
+    if ([v isKindOfClass:NSString.class] && [(NSString *)v length] > 0) {
+        if (hitKey) *hitKey = key;
+        return (NSString *)v;
+    }
     return nil;
 }
 
@@ -809,8 +845,7 @@ static NSString *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace) {
 
     // ⑤ 子对象链（逻辑控制器 / 联系人 / 会话对象）
     for (NSString *h in PJQGChatIdChildKeyCandidates()) {
-        id child = nil;
-        @try { child = [vc valueForKey:h]; } @catch (NSException *e) { continue; }
+        id child = PJQGSafeObjectForKey(vc, h);
         if (!child || PJQGIsClassObjectSafely(child)) continue;
 
         @try {
@@ -882,19 +917,26 @@ static id PJQGFindProvider(SEL sel, NSString **howFound) {
             gPJQGProviderCache[key] = (id)c;
             return (id)c;
         }
-        for (NSString *g in @[ @"sharedInstance", @"sharedManager", @"defaultManager", @"shared",
-                               @"manager", @"defaultInstance", @"instance", @"getInstance",
-                               @"sharedModel", @"sharedDataModel", @"currentManager" ]) {
-            SEL gs = NSSelectorFromString(g);
-            if (![c respondsToSelector:gs]) continue;
-            @try {
+
+        // 注意：respondsToSelector: 会触发该类的 +initialize，而 +initialize 里可能抛异常
+        // （MikotoHelper 的类会去碰微信的 protobuf 对象）。整个探测循环必须包 @try。
+        @try {
+            for (NSString *g in @[ @"sharedInstance", @"sharedManager", @"defaultManager", @"shared",
+                                   @"manager", @"defaultInstance", @"instance", @"getInstance",
+                                   @"sharedModel", @"sharedDataModel", @"currentManager" ]) {
+                SEL gs = NSSelectorFromString(g);
+                if (!gs || ![c respondsToSelector:gs]) continue;
                 id inst = ((id (*)(id, SEL))objc_msgSend)(c, gs);
                 if (inst && !PJQGIsClassObjectSafely(inst) && [inst respondsToSelector:sel]) {
                     if (howFound) *howFound = [NSString stringWithFormat:@"单例 +[%@ %@]", cn, g];
                     gPJQGProviderCache[key] = inst;
                     return inst;
                 }
-            } @catch (NSException *e) { }
+            }
+        } @catch (NSException *e) {
+            PJQGLog(@"[provider] +[%@ …] 探测异常: %@", cn, e.reason ?: e.name);
+        } @catch (...) {
+            PJQGLog(@"[provider] +[%@ …] 探测到非 Objective-C 异常", cn);
         }
     }
     gPJQGProviderCache[key] = [NSNull null];
@@ -990,7 +1032,7 @@ static NSString *PJQGDeviceName(void) {
     return @"?";
 }
 
-static NSString *PJQGDiagnose(id chatVC) {
+static NSString *PJQGDiagnoseDetail(id chatVC) {
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     NSMutableString *s = [NSMutableString string];
     [s appendFormat:@"======== MikotoQuickGroup 诊断报告 v%@ ========\n", kPJQGVersion];
@@ -1111,6 +1153,89 @@ static NSString *PJQGDiagnose(id chatVC) {
     }
     [s appendString:@"======== 报告结束 ========\n"];
     return s;
+}
+
+// ---------------- 保证能出报告 ----------------
+// 上一版的问题：完整报告里只要有一条语句抛异常（微信的 protobuf 基类把
+// -valueForUndefinedKey: 重写成直接抛异常，信息形如 "Property Name should be baseResponse"），
+// 整份报告就只剩一行错误，什么线索都拿不到。
+// 现在改成两段式：先输出一份「全部走运行时元数据、绝不抛异常」的最小报告（含成员变量名称全表），
+// 再尽力追加完整报告；完整报告炸了也不影响前面那部分。
+
+static NSString *PJQGDiagnoseMini(id chatVC) {
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"======== MikotoQuickGroup 诊断报告 v%@ ========\n", kPJQGVersion];
+    @try { [s appendFormat:@"时间     : %@\n", [NSDate date]]; } @catch (NSException *e) { }
+    @try { [s appendFormat:@"设备     : %@\n", PJQGDeviceName()]; } @catch (NSException *e) { }
+    @try { [s appendFormat:@"PID      : %d\n", getpid()]; } @catch (NSException *e) { }
+    @try { [s appendFormat:@"Bundle   : %@\n", NSBundle.mainBundle.bundleIdentifier ?: @"?"]; }
+    @catch (NSException *e) { }
+    @try {
+        [s appendFormat:@"WeChat   : %@ (%@)\n",
+            [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?",
+            [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?"];
+    } @catch (NSException *e) { }
+    @try {
+        [s appendFormat:@"安全模式 : %@   深度诊断 : %@\n",
+            PJQGSafeMode() ? @"开启" : @"关闭", PJQGDeepDiag() ? @"开启" : @"关闭"];
+    } @catch (NSException *e) { }
+    @try {
+        [s appendFormat:@"上次崩溃点: %@\n",
+            [NSUserDefaults.standardUserDefaults objectForKey:kPJQGRiskyFlagKey] ?: @"(无)"];
+    } @catch (NSException *e) { }
+    @try { [s appendFormat:@"实际日志 : %@\n", PJQGLogPath()]; } @catch (NSException *e) { }
+    @try { [s appendString:@"日志落点候选:\n"]; [s appendString:PJQGLogPathCandidates()]; }
+    @catch (NSException *e) { }
+
+    // ★ 最关键的定位信息：当前聊天窗口的成员变量名称与类型全表
+    //   纯运行时元数据（不读对象内存、不发消息给未知类），绝对不会抛异常
+    @try {
+        [s appendString:@"\n--- 当前聊天窗口（元数据，保证输出） ---\n"];
+        if (chatVC) {
+            [s appendFormat:@"  类名: %@\n", NSStringFromClass([chatVC class])];
+            [s appendFormat:@"  匹配原因: %@\n", gPJQGLasMatchReason ?: @"?"];
+            [s appendFormat:@"  动态捕获: %@ (%@)\n",
+                objc_getAssociatedObject(chatVC, kPJQGCapturedIdKey) ?: @"(无)",
+                objc_getAssociatedObject(chatVC, kPJQGCapturedHowKey) ?: @"-"];
+            [s appendString:@"  成员变量名称全表:\n"];
+            [s appendString:PJQGIvarNameTable(chatVC, 320)];
+        } else {
+            [s appendString:@"  (尚未进入聊天窗口)\n"];
+        }
+    } @catch (NSException *e) {
+        [s appendFormat:@"  ⚠︎ 元数据段异常: %@\n", e.reason];
+    }
+
+    // MikotoHelper 类探测：NSClassFromString 只查表，不触发 +initialize，安全
+    @try {
+        [s appendString:@"\n--- MikotoHelper 是否已加载 ---\n"];
+        for (NSString *cn in @[ @"PJGroupDataModel", @"PJMisakaManager", @"PJGroupManager",
+                                @"PJManagerModel", @"PJHelper", @"PJPluginModel",
+                                @"PJGroupModel", @"PJSettingGroupVC" ]) {
+            [s appendFormat:@"  %@ : %@\n", cn, NSClassFromString(cn) ? @"✓ 存在" : @"✗ 不存在"];
+        }
+    } @catch (NSException *e) { }
+    return s;
+}
+
+static NSString *PJQGDiagnose(id chatVC) {
+    NSMutableString *out = [NSMutableString string];
+
+    @try { [out appendString:PJQGDiagnoseMini(chatVC)]; }
+    @catch (NSException *e) { [out appendFormat:@"(最小报告也失败了: %@)\n", e.reason]; }
+
+    [out appendString:@"\n\n########## 完整报告（尽力输出） ##########\n"];
+    @try {
+        [out appendString:PJQGDiagnoseDetail(chatVC)];
+    } @catch (NSException *e) {
+        [out appendFormat:
+            @"⚠︎ 完整报告在此处中断: %@\n"
+             "（不影响上面「元数据」部分 —— 定位会话 ID 字段所需的信息已经在里面了，直接发我即可）\n",
+            e.reason ?: e.name];
+    } @catch (...) {
+        [out appendString:@"⚠︎ 完整报告中断：非 Objective-C 异常\n"];
+    }
+    return out;
 }
 
 #pragma mark - 诊断报告页（全屏，可选中/复制）

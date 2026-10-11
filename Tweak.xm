@@ -2709,7 +2709,7 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消"
                         style:UIAlertActionStyleCancel handler:nil]];
     [self anchorPopover:sheet];
-    [vc presentViewController:sheet animated:YES completion:nil];
+    PJQGPresentOnPanel(sheet);
 }
 
 - (void)anchorPopover:(UIAlertController *)sheet {

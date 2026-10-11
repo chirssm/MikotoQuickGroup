@@ -46,7 +46,7 @@
 
 #pragma mark - 常量
 
-static NSString *const kPJQGVersion          = @"1.7";
+static NSString *const kPJQGVersion          = @"1.8";
 static NSString *const kPJQGDefaultKindKey   = @"pjqg_default_kind";   // NSInteger, -1 = 未设置
 static NSString *const kPJQGBubbleVisibleKey = @"pjqg_bubble_visible";
 static NSString *const kPJQGSilentKey        = @"pjqg_silent_alert";
@@ -1004,7 +1004,9 @@ static id PJQGSafeObjectForKey(id obj, NSString *key) {
         char rt[8] = {0};
         method_getReturnType(m, rt, sizeof(rt));
         if (rt[0] != '@') return nil;
-        if (![obj respondsToSelector:g]) return nil;
+        // v1.8：删掉多余的 [obj respondsToSelector:g] —— 它会触发该类的 +initialize，
+        //   而微信的 protobuf 基类正是在 +initialize 里抛 「Property Name should be …」。
+        //   上面 class_getInstanceMethod 已确认方法存在且返回对象，足够安全。
         return [obj valueForKey:key];
     } @catch (NSException *e) {
         return nil;
@@ -1383,7 +1385,9 @@ static NSString *PJQGChatIdInner(id vc, NSString **how, NSMutableString *trace) 
     for (NSString *sn in selNames) {
         SEL s = NSSelectorFromString(sn);
         @try {
-            if (![vc respondsToSelector:s]) continue;
+            // v1.8：原来这里有 [vc respondsToSelector:s] —— 会触发 +initialize（可能抛异常）。
+            //   下一行的 PJQGMethodReturnsObject 本身就走 class_getInstanceMethod + 返回类型校验，
+            //   完全覆盖了它的作用，所以直接去掉。
             if (!PJQGMethodReturnsObject(vc, s)) continue;
             id v = ((id (*)(id, SEL))objc_msgSend)(vc, s);
             if ([v isKindOfClass:NSString.class] && [(NSString *)v length] > 0) {
@@ -2920,10 +2924,13 @@ static BOOL PJQGIsChatVC(id vc) {
                 [n containsString:@"ChatRoomViewController"] || [n containsString:@"SessionViewController"]) {
                 ok = YES;
                 reason = [NSString stringWithFormat:@"类名含特征词（%@）", n];
-            } else if ([vc respondsToSelector:NSSelectorFromString(@"m_nsChatName")] ||
-                       [vc respondsToSelector:NSSelectorFromString(@"m_nsChatRoomUserName")]) {
+            // v1.8：这里原来是 [vc respondsToSelector:…]，而 respondsToSelector: 会触发该类的
+            //   +initialize —— 微信的 protobuf 基类曾在 +initialize 里抛异常（Property Name should be …）。
+            //   改成纯元数据查询（class_getInstanceVariable 不触发 +initialize），彻底摘掉这颗雷。
+            } else if (class_getInstanceVariable(object_getClass(vc), "m_nsChatName") ||
+                       class_getInstanceVariable(object_getClass(vc), "m_nsChatRoomUserName")) {
                 ok = YES;
-                reason = @"响应对应会话名选择子";
+                reason = @"类含会话名成员变量";
             }
         }
     } @catch (NSException *e) { ok = NO; }
@@ -2965,6 +2972,11 @@ typedef void (*PJQGMSHookMessageEx_t)(Class, SEL, IMP, IMP *);
 static PJQGMSHookMessageEx_t gPJQGMSHook = NULL;
 static BOOL                  gPJQGHookProbed = NO;
 static NSMutableDictionary  *gPJQGHookTable = nil;   // "Cls|sel" -> NSNumber(uintptr_t) 原始 IMP
+// ★ v1.8：hook 回调重入保护。v1.7 没有这个，一旦回调里再触发同一批 setter 就是无限递归 → 栈溢出闪退
+static int                   gPJQGHookDepth = 0;
+// ★ v1.8：已处理过的类。viewWillAppear:/viewDidAppear: 每次都会进 PJQGHookSetters，
+//   没有去重就会反复遍历父类链 + 反复碰 MSHookMessageEx
+static NSMutableSet         *gPJQGHookedClasses = nil;
 
 static BOOL PJQGClassHasOwnMethod(Class k, SEL s);
 
@@ -2982,104 +2994,63 @@ static IMP PJQGOrigIMPFor(id self, SEL _cmd) {
     return NULL;
 }
 
+// ★ v1.8：只做「最轻」的记录 —— 入参本身是字符串、且长得像会话 ID 才记。
+//   绝不再对入参做成员变量挖掘（PJQGUsrNameFromObject）：
+//   v1.7 每次回调都挖一遍 ivar，被 UIKit 热方法高频调用 → 既慢又会踩野指针（SIGSEGV，@try 拦不住）。
 static void PJQGHookSetter(id self, SEL _cmd, id arg) {
-    @try {
-        NSString *cid = nil;
-        NSString *src = nil;
-        if ([arg isKindOfClass:NSString.class]) {
-            cid = (NSString *)arg;
-            src = NSStringFromSelector(_cmd);
-        } else if (arg) {
-            cid = PJQGUsrNameFromObject(arg);
-            if (cid.length)
-                src = [NSString stringWithFormat:@"%@ → m_nsUsrName", NSStringFromSelector(_cmd)];
-        }
-        if (cid.length > 0) PJQGRememberCapturedChatId(self, cid, src);
-    } @catch (NSException *e) { }
+    if (gPJQGHookDepth == 0) {
+        gPJQGHookDepth++;
+        @try {
+            if ([arg isKindOfClass:NSString.class]) {
+                NSString *s = (NSString *)arg;
+                if (s.length >= 6 && s.length <= 128 && PJQGLooksLikeChatIdScore(s) >= 15) {
+                    PJQGRememberCapturedChatId(self, s, NSStringFromSelector(_cmd));
+                }
+            }
+        } @catch (NSException *e) { }
+        gPJQGHookDepth--;
+    }
 
     IMP orig = PJQGOrigIMPFor(self, _cmd);
     if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, arg);
 }
 
-// ★ v1.7：通用 setter 捕获（解决「动态捕获一直是 (无)」）
-//   旧做法只挂了 11 个写死的选择子（setM_nsChatName: / setChatUserName: …），
-//   微信 8.0.65 的 BaseMsgContentViewController 上可能一个都不存在 —— 这就是动态捕获一直为空的原因。
-//   现在：把聊天窗口类（含父类链，止于 UIViewController）所有「参数为对象」的 setter 全挂上，
-//   但只有在「值本身长得就像会话 ID（wxid_ / @chatroom / gh_ / @openim）」时才记录，
-//   避免把 setTitle: 之类的普通字符串当成会话 ID 污染识别结果。
+// ★ v1.8：通用 setter 捕获（PJQGHookSetterStrict / PJQGHookSettersGeneric）**已永久禁用**。
+//
+//   v1.7 的实现在真机上导致「微信整体闪退」，原因有三，任何一条都足以致命：
+//     ① 它由 %hook UIViewController 的 viewWillAppear:/viewDidAppear: 触发 —— 那是**全局** hook，
+//        微信每个 VC 出现都会走到，于是把聊天窗口类**整条父类链**上所有「参数为对象」的 setter
+//        全替换掉，其中包含 setView: / setTitle: / setDelegate: 这类 UIKit 热方法；
+//        父类链上的公共基类被多个 VC 共享 → 危害扩散到整个 App。
+//     ② PJQGHookSettersEarly 在启动后 1.5s、**主线程**上遍历所有类，并对最多 60 个候选类各装
+//        最多 160 个 hook（理论上万级 MSHookMessageEx）→ 主线程长时间阻塞 → iOS watchdog 杀进程。
+//     ③ 回调体里对入参调 PJQGUsrNameFromObject 挖 ivar，被热方法高频调用，既慢又可能踩野指针
+//        （SIGSEGV —— @try 拦不住，直接闪退）。
+//
+//   结论：这条「动态捕获」路径的收益（只是第①级识别源的一个补充）远小于风险，**永久移除**。
+//   会话 ID 现在完全依靠：动态捕获(关联对象) → KVC → 选择子 → 成员变量扫描 → 单条消息对象 →
+//   子对象链 → 全局服务链(手动开) → 消息回溯 → 手动输入。
 static void PJQGHookSetterStrict(id self, SEL _cmd, id arg) {
-    @try {
-        NSString *cid = nil;
-        NSString *src = nil;
-        if ([arg isKindOfClass:NSString.class]) {
-            NSString *s = (NSString *)arg;
-            if (s.length >= 6 && s.length <= 128 && PJQGLooksLikeChatIdScore(s) >= 15) {
-                cid = s;
-                src = NSStringFromSelector(_cmd);
-            }
-        } else if (arg) {
-            NSString *u = PJQGUsrNameFromObject(arg);
-            if (u.length && PJQGLooksLikeChatIdScore(u) >= 15) {
-                cid = u;
-                src = [NSString stringWithFormat:@"%@ → 对象成员", NSStringFromSelector(_cmd)];
-            }
-        }
-        if (cid.length > 0) PJQGRememberCapturedChatId(self, cid, src);
-    } @catch (NSException *e) { }
-
-    IMP orig = PJQGOrigIMPFor(self, _cmd);
-    if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, arg);
+    (void)self; (void)_cmd; (void)arg;
 }
 
 static void PJQGHookSettersGeneric(Class cls) {
-    @try {
-        if (!cls || !gPJQGMSHook) return;
-        if (!gPJQGHookTable) gPJQGHookTable = [NSMutableDictionary dictionary];
-
-        Class stopA = [UIViewController class];
-        Class stopB = [UIResponder class];
-        int guard = 0, hooked = 0;
-        for (Class k = cls; k && k != Nil && guard++ < 10; k = class_getSuperclass(k)) {
-            if (k == stopA || k == stopB || k == [NSObject class]) break;
-            unsigned cnt = 0;
-            Method *ms = class_copyMethodList(k, &cnt);
-            if (!ms) continue;
-            for (unsigned i = 0; i < cnt; i++) {
-                SEL s = method_getName(ms[i]);
-                const char *sn = sel_getName(s);
-                if (!sn || strncmp(sn, "set", 3) != 0) continue;
-                if (strlen(sn) < 5) continue;
-                char c4 = sn[3];
-                if (!(c4 >= 'A' && c4 <= 'Z')) continue;
-                if (method_getNumberOfArguments(ms[i]) != 3) continue;
-                char t[16] = {0};
-                method_getArgumentType(ms[i], 2, t, sizeof(t));
-                if (t[0] != '@') continue;
-                if (t[1] == '?' || t[1] == '#') continue;    // 跳过 block / Class 参数
-                NSString *key = [NSString stringWithFormat:@"%s|%s", class_getName(k), sn];
-                if (gPJQGHookTable[key]) continue;
-                @try {
-                    IMP orig = NULL;
-                    gPJQGMSHook(k, s, (IMP)PJQGHookSetterStrict, &orig);
-                    if (orig) {
-                        gPJQGHookTable[key] = [NSNumber numberWithUnsignedLongLong:(unsigned long long)(uintptr_t)orig];
-                        hooked++;
-                    }
-                } @catch (NSException *e) { }
-                if (hooked >= 160) break;
-            }
-            free(ms);
-            if (hooked >= 160) break;
-        }
-        if (hooked) PJQGLog(@"[hook] 通用 setter 捕获 %s: 新挂 %d 个（表内共 %lu）",
-                            class_getName(cls), hooked, (unsigned long)gPJQGHookTable.count);
-    } @catch (NSException *e) {
-        PJQGLog(@"[hook] 通用 setter 捕获异常: %@", e.reason);
+    (void)cls;
+    static BOOL once = NO;
+    if (!once) {
+        once = YES;
+        PJQGLog(@"[hook] 通用 setter 捕获 = 已禁用（v1.8 安全策略；v1.7 曾致微信整体闪退）");
     }
 }
 
 static void PJQGHookSetters(Class cls) {
     if (!cls) return;
+    // v1.8：每个类只处理一次（viewWillAppear:/viewDidAppear: 会反复进来）
+    if (!gPJQGHookedClasses) gPJQGHookedClasses = [NSMutableSet set];
+    NSString *clsName = NSStringFromClass(cls);
+    if (!clsName.length || [gPJQGHookedClasses containsObject:clsName]) return;
+    [gPJQGHookedClasses addObject:clsName];
+
     if (!gPJQGHookProbed) {
         gPJQGHookProbed = YES;
         gPJQGMSHook = (PJQGMSHookMessageEx_t)dlsym(RTLD_DEFAULT, "MSHookMessageEx");
@@ -3118,46 +3089,19 @@ static void PJQGHookSetters(Class cls) {
         }
     }
 
-    // v1.7：再挂一遍「通用 setter 捕获」（只在值像会话 ID 时才记录）
-    PJQGHookSettersGeneric(cls);
+    // v1.8：原来这里还会调 PJQGHookSettersGeneric(cls) 做「通用 setter 捕获」——
+    //   那是导致微信整体闪退的直接原因，已永久移除。
 }
 
 #pragma mark - 载入自证
 
-// 启动后趁早把可能的聊天窗口类挂上 setter 捕获，提高「动态捕获」命中率
+// ★ v1.8：早期批量挂钩**已永久禁用**。
+//   v1.7 在启动后 1.5s 于**主线程**遍历全 App 所有类，对最多 60 个候选类各装最多 160 个 hook
+//   （万级 MSHookMessageEx），主线程长时间阻塞 → iOS watchdog 直接杀进程 = 「微信闪退」。
+//   而且它做的事（挂 setter 捕获）只是识别链第①级的补充，收益远小于风险。
+//   现在只保留 %hook viewWillAppear:/viewDidAppear:，在真正进入聊天窗口时按需、按类挂钩。
 static void PJQGHookSettersEarly(void) {
-    @try {
-        NSMutableArray *targets = [NSMutableArray array];
-        unsigned int count = 0;
-        Class *all = objc_copyClassList(&count);
-        if (all) {
-            for (unsigned int i = 0; i < count; i++) {
-                const char *nm = class_getName(all[i]);
-                if (!nm) continue;
-                NSString *s = [NSString stringWithUTF8String:nm];
-                if ([s hasPrefix:@"PJQG"]) continue;
-                if ([s containsString:@"MsgContent"] ||
-                    [s containsString:@"ChatViewController"] ||
-                    [s containsString:@"ChatRoomViewController"]) {
-                    [targets addObject:s];
-                    if (targets.count >= 60) break;
-                }
-            }
-            free(all);
-        }
-        if (targets.count == 0) {
-            PJQGLog(@"[hook] 早期候选类 0 个（聊天窗口类尚未注册，交由首次进入时挂钩）");
-            return;
-        }
-        PJQGLog(@"[hook] 早期候选类 %lu 个: %@", (unsigned long)targets.count,
-                [targets componentsJoinedByString:@", "]);
-        for (NSString *cn in targets) {
-            Class c = NSClassFromString(cn);
-            if (c) { PJQGHookSetters(c); PJQGHookSettersGeneric(c); }
-        }
-    } @catch (NSException *e) {
-        PJQGLog(@"[hook] 早期挂钩失败: %@", e.reason);
-    }
+    PJQGLog(@"[hook] 早期批量挂钩 = 已禁用（v1.8 安全策略）");
 }
 
 static void PJQGShowLaunchAlert(void) {
@@ -3197,14 +3141,14 @@ static void PJQGShowLaunchAlert(void) {
                 "日志：%@", PJQGLogPath()];
     } else {
         msg = [NSString stringWithFormat:
-               @"插件已被微信加载。\n\n"
+               @"插件已被微信加载（v%@）。\n\n"
+                "★ 本版已移除导致微信闪退的「批量挂钩」逻辑：不再在启动时对所有类做上万次方法替换，"
+                "也不会再去替换 setView: / setTitle: 这类 UIKit 热方法。\n\n"
                 "进入任意聊天窗口：右侧有可拖动的「分组」按钮，旁边蓝色「诊」按钮直接打开诊断报告；"
                 "右上角也有「分组」。\n\n"
                 "单击「分组」= 归入默认分组；长按 = 菜单。\n\n"
-                "★ 当前版本 v%@：点一下「分组」，屏幕上会立刻出现一条提示（「已响应 · 正在识别会话」），"
-                "之后每一步都会继续显示结果。所以现在不会再出现「点了完全没反应」——"
-                "如果连那条提示都没出现，说明插件没被加载进来。\n\n"
-                "如果弹出「分组出现异常」，正文里会写「阶段：xxx」（死在识别/provider/调用哪一步），"
+                "点一下「分组」，屏幕上会立刻出现提示（「已响应 · 正在识别会话」），之后每一步都会继续显示结果。\n\n"
+                "如果弹出「分组出现异常」，正文里会写「阶段：xxx」（死在识别 / provider / 调用哪一步），"
                 "并且会把【阶段 + 异常调用栈 + 最近日志】自动复制到剪贴板 —— 直接粘贴发我即可。\n\n"
                 "如果提示「未识别到会话」，会自动弹出报告并复制到剪贴板，直接发我即可；"
                 "也可以长按「分组」→「自检」，把自检结果整段发我。\n\n日志：%@",

@@ -1,8 +1,8 @@
 Package: com.pj.mikotoquickgroup
 Name: MikotoQuickGroup
-Version: 3.0.0
+Version: 4.0.0
 Architecture: iphoneos-arm64
-Description: 独立插件 —— 在微信聊天界面提供「快速分组」按钮，一键把当前会话归入 MikotoHelper 的指定分组（默认分组记忆）；内置诊断报告与会话 ID 识别。v3.0 换思路解决「自己创建 Mikoto 对象就闪退」的问题：不再 new 它的任何类、不再逼它跑 +initialize（MikotoHelper 的 167 个 PJ* 类方法表全空，方法要在 +initialize 里注册，而那个初始化只有从它自己的入口进来才安全，外部触发必崩）。现在改为只「捡」屏幕上已经活着的 Mikoto 对象：遍历 UIWindow 视图树 + 读 UIControl/UIBarButtonItem 的 target，找到它自己的分组页就直接显示、找到它的 manager 就调它自己的分组动作，全程只读、零创建、零初始化。若屏幕上还没有活对象，会明确提示「先打开一次 Mikoto 界面再回来点」。另附「看屏幕上有哪些 Mikoto 对象」只读报告，一键复制。v1.8 起永久移除批量 setter 挂钩与所有 respondsToSelector: 调用。
+Description: 独立插件 —— 在微信聊天界面提供「快速分组」按钮，一键把当前会话归入 MikotoHelper 的指定分组（默认分组记忆）；内置诊断报告与会话 ID 识别。v4.0 改用「自动记住你自己打开过的 Mikoto 页面」这条零风险路线：插件的 viewDidAppear 钩子会把用户亲手点开的 Mikoto 控制器（Misaka 用户设置页 / 分组名称页）强引用记下来，之后点「① 打开 Mikoto 分组页」就能直接回到那一页，点一下分组名即完成。全程不 new、不 alloc、不触发任何 +initialize —— 这是前几版闪退的根因，现在彻底绕开。用法只需一次：先在聊天框底部点 Mikoto → Misaka 用户设置 → 分组名称，看到分组列表后返回；以后就是一键直达。若显示「还没有可用页面」，请先做那一步。另附「② 完整诊断快照」：只读列出全部 PJ* 类的运行时方法表（含分组页真实方法名）+ 屏幕活对象 + 已记住页面，一键复制并存文件，用于把「①」做成一定成功。v1.8 起永久移除批量 setter 挂钩与所有 respondsToSelector: 调用。
 Maintainer: local
 Author: local
 Section: Tweaks

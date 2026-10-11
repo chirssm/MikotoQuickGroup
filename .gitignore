@@ -3,3 +3,6 @@ packages/
 *.o
 *.log
 .DS_Store
+dist/
+MikotoQuickGroup.dylib
+MikotoQuickGroup.deb

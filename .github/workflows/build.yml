@@ -42,14 +42,19 @@ jobs:
           echo "--- .deb ---"
           find . -name "*.deb" -not -path "./.git/*" -print
 
+      - name: 收集产物（复制到非隐藏目录）
+        run: |
+          mkdir -p dist
+          find .theos -name "*.dylib" -exec cp {} dist/ \; 2>/dev/null || true
+          find .theos -name "*.dylib" -print
+          ls -la dist/ || true
+
       - name: 上传 dylib
         uses: actions/upload-artifact@v4
         with:
           name: MikotoQuickGroup-dylib
-          path: |
-            .theos/obj/**/*.dylib
-            .theos/**/*.dylib
-          if-no-files-found: warn
+          path: dist/*.dylib
+          if-no-files-found: error
 
       - name: 上传 deb
         uses: actions/upload-artifact@v4

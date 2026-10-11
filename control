@@ -1,8 +1,8 @@
 Package: com.pj.mikotoquickgroup
 Name: MikotoQuickGroup
-Version: 1.9.0
+Version: 2.0.0
 Architecture: iphoneos-arm64
-Description: 独立插件 —— 在微信聊天界面提供「快速分组」按钮，一键把当前会话归入 MikotoHelper 的指定分组（默认分组记忆）；内置诊断报告与会话 ID 识别。v1.9：换思路 —— 不再自己实现分组写入，改为直接复用 MikotoHelper 自己的链路（Misaka 用户设置 → 分组名称）。新增最权威的会话 ID 来源（PJMisakaManager.settingVC.m_nsUsrName，即 MikotoHelper 自己「用户设置」页上显示的那个）；长按菜单新增「打开 Mikoto 分组列表（实验）」与「探测 Mikoto 分组接口（自动复制）」。v1.8 起已永久移除导致微信闪退的批量 setter 挂钩与所有 respondsToSelector: 调用。
+Description: 独立插件 —— 在微信聊天界面提供「快速分组」按钮，一键把当前会话归入 MikotoHelper 的指定分组（默认分组记忆）；内置诊断报告与会话 ID 识别。v2.0 修两个真机问题：①「长按→分析接口→微信直接闪退」—— 根因是旧版探测用 objc_copyClassList 扫微信全部类（3~5 万个）再逐个查 18 个选择子，主线程被占满触发看门狗；现在只查十几个已知类名，微秒级完成。②「① 第一步不成功」—— 静态逆向证明 MikotoHelper 的 PJMisakaManager 里根本没有 settingVC 字段（真名 _settingVC，且是微信自己的 NewSettingViewController），旧版的单例路径必然失败；现在改成自己 new 它自己的「分组名称」页（PJGroupListViewController，成员变量 _userName/_type/_dataArray），把当前会话 ID 填进 _userName 再 push，点一下分组名就完成分组，写分组逻辑完全由 MikotoHelper 执行。另外：探测不再对 ivar 取值发消息（v1.7 闪退根因），报告同时落盘为 txt。
 Maintainer: local
 Author: local
 Section: Tweaks

@@ -20,6 +20,43 @@
 | **v1.7** | 「**点分组弹出：分组出现异常 / Property Name should be baseRequest**」（微信本体抛的异常，MikotoHelper 里没有这个串） | **① 全链路「阶段追踪」：异常弹窗直接写「死在哪个阶段」；② 异常摘要 = 阶段 + 异常自己的调用栈 + 当前线程调用栈 + 最近 30 行日志，一次性复制到剪贴板；③ 识别链 / provider 查找 / 写入流程各自再包一层 `@try`；④ 新增「通用 setter 捕获」——把聊天窗口类（止于 UIViewController）所有对象型 setter 都挂上** |
 | **v1.8** | 「**这一次微信都闪退了**」（v1.7 引入，`@try` 拦不住的进程级崩溃） | **紧急回退 + 加固：① 永久移除「通用 setter 捕获」——它会经 `%hook UIViewController`（全局 hook）把父类链上所有对象型 setter 全替换，含 `setView:` / `setTitle:` / `setDelegate:` 等 UIKit 热方法；② 永久禁用 `PJQGHookSettersEarly`——启动后 1.5s 在主线程遍历全 App 类并装最多 60×160 个 hook，主线程阻塞被 iOS watchdog 杀进程；③ hook 回调去掉成员变量挖掘（不再踩野指针），并加重入保护；④ 每个类只挂钩一次（`gPJQGHookedClasses`）；⑤ 彻底清除所有 `respondsToSelector:`——它会触发微信 protobuf 基类的 `+initialize` 并抛异常；⑥ 保留 v1.7 的阶段追踪与异常调用栈自诊断** |
 | **v1.9** | 「**换个角度：走 Mikoto 自己的路径**」——用户截图证实 MikotoHelper 自带完整链路：聊天框底部「Mikoto」→「Misaka 用户设置」→「分组名称」→ 选分组，且**「用户设置」页上直接显示着「当前会话 ID」** | **① 新增最权威的会话 ID 来源（识别链 ⓪ 级）：`PJMisakaManager.settingVC.m_nsUsrName` —— MikotoHelper 自己认定的那个，不用再猜微信字段；② 新增「打开 Mikoto 分组列表（实验）」：直接复用它的 `PJMisakaSettingViewController` 与 `misaka_selectGroupAction` / `groupSettingFriendGroupIDAction` 等动作，把它自己的分组列表调出来，选完由它自己完成写入；③ 新增「探测 Mikoto 分组接口」：只读打印关键 selector 的实现者+完整签名、9 个目标类的运行时方法表、`PJMisakaManager` 实例的全部成员变量取值 —— 一键复制发回；④ 全部为只读 + 显式点击触发 + 危险调用哨兵** |
+| **v2.0** | 「**第一步不成功；长按→探测 Mikoto 分组接口→微信直接闪退**」 | **① 修闪退：删除 `objc_copyClassList` 全表扫描** —— 旧版探测把微信全部类（3~5 万个）逐个查 18 个选择子 ≈ 近百万次运行时查询，主线程被占满触发 iOS watchdog（0x8badf00d）杀进程；现在只查 15 个已知类名，微秒级；**② 修「第一步不成功」：静态逆向证明 v1.9 的路是死的** —— `PJMisakaManager` 里**根本没有 `settingVC` 字段**（真名 `_settingVC`，且类型是微信自己的 `NewSettingViewController`），`m_nsUsrName` 也非真名（真名 `_m_nsUsrName`），所以单例路径必然失败；**③ 改为「自己造 Mikoto 的分组页」**：`PJGroupListViewController`（父类 `PJBaseViewController`，成员变量 `_userName` / `_type` / `_dataArray` / `_tableView`）→ 把当前会话 ID 写进 `_userName` → push 出来 → 点一下分组名即完成分组，写入逻辑完全由 MikotoHelper 执行；**④ 探测不再对 ivar 取值发消息**（v1.7 野指针 SIGSEGV 根因），只列名字+类型；**⑤ 报告同时落盘成 txt**（剪贴板会被聊天输入框截断） |
+| **v2.0 的重要发现** | —— | 静态逆向：MikotoHelper 的 167 个 `PJ*` 类，`class_ro_t.baseMethods` **全部是 count=0 的空方法表**，但每个类都有一个真实的 `+[Class initialize]`（IMP 指向 `__text`）。**结论：这个 dylib 被加固过，实例方法是运行时在 `+initialize` 里动态注册的。** 所以任何「还没跟这个类打过交道」的进程里，`class_getInstanceMethod` 什么都查不到 —— 必须先给类发一条消息把 `+initialize` 跑掉（本版新增 `PJQGEnsureClassReady()`），否则查接口永远是「无」。 |
+
+### v2.0 的两项修正（本次重点）
+
+**修正 1 —— 闪退：探测不再扫全表**
+
+| 旧（v1.9） | 新（v2.0） |
+|---|---|
+| `objc_copyClassList(&count)` 取微信全部类（旧机型 3~5 万个） | 只遍历 15 个「已知的 Mikoto 类名」（`PJQGKnownClassNames()`） |
+| 18 个选择子 × 每类 `class_getInstanceMethod` + `class_getClassMethod` ≈ 近百万次 | 18 个选择子 × 15 类 = 270 次 |
+| 主线程被占满 → watchdog 杀进程 → 「微信直接闪退」 | 微秒级完成，不可能触发 watchdog |
+
+**修正 2 —— 「第一步不成功」：不再找 Mikoto 的单例，自己造它的页面**
+
+v1.9 走的是 `PJMisakaManager` 单例 → `settingVC` ivar，静态逆向已证伪：
+
+- `PJMisakaManager` 的真实成员变量里**没有** `settingVC`（真名 `_settingVC`，类型 `NewSettingViewController` —— 微信自己的设置页，跟 Misaka 分组无关）；
+- `m_nsUsrName` 也不是真名（真名 `_m_nsUsrName`）。
+
+所以 v1.9 的「①」永远拿不到实例，必然报「没找到 Misaka 用户设置实例」。
+
+v2.0 的做法（不需要任何单例）：
+
+```
+PJGroupListViewController : PJBaseViewController
+    _selectIndexPath(NSIndexPath) / _type(int) / _userName(NSString)
+    _tableView(UITableView) / _dataArray(NSMutableArray)
+
+① PJQGEnsureClassReady(cls)                     // 逼 +initialize，让方法真正注册进去
+② 优先用它自己的构造器：initWithUserName: / initWithUserName:type: / …
+③ 退化：alloc/init 后直接写 _userName（也试 _m_nsUsrName / setUserName: 等）
+④ push 出来（找不到导航控制器就临时包一个 UINavigationController）
+⑤ 用户在屏幕上点一下分组名 —— 写入完全由 MikotoHelper 自己的代码完成
+```
+
+**会话 ID 识别链的变化**：v1.9 加的「⓪ MikotoHelper 单例」已移除 —— 全局「最近一次捕获」可能属于别的会话，拿来当当前会话 ID 会**分错组**；现在只在「打开 Mikoto 分组页」时作为最后的兜底。
 
 ### v1.9 的 4 项改动（本次重点）
 

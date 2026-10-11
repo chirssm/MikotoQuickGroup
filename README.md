@@ -22,8 +22,20 @@
 | **v1.9** | 「**换个角度：走 Mikoto 自己的路径**」——用户截图证实 MikotoHelper 自带完整链路：聊天框底部「Mikoto」→「Misaka 用户设置」→「分组名称」→ 选分组，且**「用户设置」页上直接显示着「当前会话 ID」** | **① 新增最权威的会话 ID 来源（识别链 ⓪ 级）：`PJMisakaManager.settingVC.m_nsUsrName` —— MikotoHelper 自己认定的那个，不用再猜微信字段；② 新增「打开 Mikoto 分组列表（实验）」：直接复用它的 `PJMisakaSettingViewController` 与 `misaka_selectGroupAction` / `groupSettingFriendGroupIDAction` 等动作，把它自己的分组列表调出来，选完由它自己完成写入；③ 新增「探测 Mikoto 分组接口」：只读打印关键 selector 的实现者+完整签名、9 个目标类的运行时方法表、`PJMisakaManager` 实例的全部成员变量取值 —— 一键复制发回；④ 全部为只读 + 显式点击触发 + 危险调用哨兵** |
 | **v2.0** | 「**第一步不成功；长按→探测 Mikoto 分组接口→微信直接闪退**」 | **① 修闪退：删除 `objc_copyClassList` 全表扫描** —— 旧版探测把微信全部类（3~5 万个）逐个查 18 个选择子 ≈ 近百万次运行时查询，主线程被占满触发 iOS watchdog（0x8badf00d）杀进程；现在只查 15 个已知类名，微秒级；**② 修「第一步不成功」：静态逆向证明 v1.9 的路是死的** —— `PJMisakaManager` 里**根本没有 `settingVC` 字段**（真名 `_settingVC`，且类型是微信自己的 `NewSettingViewController`），`m_nsUsrName` 也非真名（真名 `_m_nsUsrName`），所以单例路径必然失败；**③ 改为「自己造 Mikoto 的分组页」**：`PJGroupListViewController`（父类 `PJBaseViewController`，成员变量 `_userName` / `_type` / `_dataArray` / `_tableView`）→ 把当前会话 ID 写进 `_userName` → push 出来 → 点一下分组名即完成分组，写入逻辑完全由 MikotoHelper 执行；**④ 探测不再对 ivar 取值发消息**（v1.7 野指针 SIGSEGV 根因），只列名字+类型；**⑤ 报告同时落盘成 txt**（剪贴板会被聊天输入框截断） |
 | **v2.0 的重要发现** | —— | 静态逆向：MikotoHelper 的 167 个 `PJ*` 类，`class_ro_t.baseMethods` **全部是 count=0 的空方法表**，但每个类都有一个真实的 `+[Class initialize]`（IMP 指向 `__text`）。**结论：这个 dylib 被加固过，实例方法是运行时在 `+initialize` 里动态注册的。** 所以任何「还没跟这个类打过交道」的进程里，`class_getInstanceMethod` 什么都查不到 —— 必须先给类发一条消息把 `+initialize` 跑掉（本版新增 `PJQGEnsureClassReady()`），否则查接口永远是「无」。 |
+| **v3.0** | 「**这次变成闪退了，有没有简单一点的办法呢，改了很多次都不行啊**」 | **彻底换思路：不再创建 / 初始化 MikotoHelper 的任何东西，只「捡」它已经活着、正在服役的对象。** ① 删除 `PJQGEnsureClassReady()` 里的 `objc_msgSend(cls, @selector(class))`（**这就是 v2.0 一点就闪退的根因**：强制触发它的 `+initialize`，而那个初始化只有从它自己的入口进来才安全），现在该函数退化为纯查询；② 删除 `PJQGMakeMikotoGroupPage()`（自己 new 它的页面）整段实现；③ 新增 `PJQGScanLiveMikotoObjects()`：遍历所有 `UIWindow` 的视图树 + 读 `UIControl.allTargets` + 读 `UIBarButtonItem.target`，把所有类名以 `PJ`/含 `Misaka`/`Mikoto` 的**活对象**捞出来（全程只读，零创建零初始化）；④ 「① 一键打开 Mikoto 分组页」改为：屏幕上已有它的分组页就直接显示、已有它的 manager 就调它自己的分组动作（白名单 + 只调无参）、都没有就明确提示「先打开一次 Mikoto 界面再回来点」；⑤ 「② 看屏幕上有哪些 Mikoto 对象」只读报告，列活对象类名 + 方法名 + 关键类当前方法数 |
 
-### v2.0 的两项修正（本次重点）
+### v3.0 的关键转变：从「造对象」到「捡对象」
+
+| | v2.0（失败） | v3.0 |
+|---|---|---|
+| 用 Mikoto 的类 | 自己 `alloc` + 自己触发 `+initialize` | **完全不碰它的类初始化**，只用它已经建好的实例 |
+| 真机结果 | **一点就闪退** | 只在屏幕上已有其对象时动作，风险最低 |
+| 闪退根因 | `objc_msgSend(cls, @selector(class))` 强制触发 `+initialize` | —— |
+| 找不到对象时 | 崩 | 提示「先打开一次 Mikoto 界面」并给出只读报告 |
+
+**核心认知**：MikotoHelper 的 `+initialize` **只有从它自己的入口（聊天框底部 Mikoto 按钮）被触发时才安全** —— 用户手动一路点进去全程不崩，就证明这条路它是能跑通的；外部代码强行触发 = 崩。所以正确姿势是**借它已经初始化好的对象用**，而不是自己造。
+
+### v2.0 的两项修正（历史记录）
 
 **修正 1 —— 闪退：探测不再扫全表**
 

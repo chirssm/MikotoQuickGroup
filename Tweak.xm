@@ -1979,7 +1979,7 @@ static void PJQGScanVCForMikoto(UIViewController *vc,
             if (it.customView) PJQGScanViewTreeForMikoto(it.customView, views, targets, seen, visited, 0);
         }
 
-        for (UIViewController *child in vc.children) {
+        for (UIViewController *child in vc.childViewControllers) {
             PJQGScanVCForMikoto(child, views, targets, seen, visited, depth + 1);
         }
         if (vc.presentedViewController) {

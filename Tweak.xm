@@ -3353,12 +3353,16 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
     //   只要这行字出现，就证明按钮和 Hook 都是好的；之后无论走进哪个分支，
     //   屏幕上一定会继续出现结果或报错 —— 再也不会出现「点了完全没反应」。
     //   （0.12s 延迟是为了确保这一帧真的画出来了，再开始可能耗时的识别。）
-    PJQGHUD(@"分组 ✓ 已响应 · 正在识别会话…", YES);
+    PJQGHUD(@"分组 ✓ 已响应 · 正在打开 Mikoto 分组页…", YES);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         PJQGSTAGE(@"onTap");
         @try {
-            [self performGroupTap];
+            // ★ v4.0：单击「分组」= 打开 Mikoto 分组页 —— 这才是真正能成的一键分组。
+            //   老的「自己识别会话 ID → 自己写入 MikotoHelper 的分组」这条路从来没成功过
+            //   （写入口在 MikotoHelper 内部且是闭源的），所以在 v4.0 里它退居长按菜单，
+            //   单击直接走「借它自己已经打开过的页面」这条百分百可靠的路径。
+            [self openMikotoGroupList];
         } @catch (NSException *e) {
             // ★ v1.7：异常逃到这一层，说明有一个我没堵住的洞。
             //   这一版把「阶段 + 调用栈 + 最近日志」一次性打出来并复制到剪贴板，

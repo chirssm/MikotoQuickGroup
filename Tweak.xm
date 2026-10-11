@@ -46,7 +46,7 @@
 
 #pragma mark - 常量
 
-static NSString *const kPJQGVersion          = @"1.4";
+static NSString *const kPJQGVersion          = @"1.5";
 static NSString *const kPJQGDefaultKindKey   = @"pjqg_default_kind";   // NSInteger, -1 = 未设置
 static NSString *const kPJQGBubbleVisibleKey = @"pjqg_bubble_visible";
 static NSString *const kPJQGSilentKey        = @"pjqg_silent_alert";
@@ -76,6 +76,11 @@ static NSString   *PJQGDiagnose(id chatVC);
 static void        PJQGRememberCapturedChatId(id obj, NSString *cid, NSString *how);
 static void        PJQGHookSetters(Class cls);
 static BOOL        PJQGDeepDiag(void);
+static BOOL        PJQGPointerLooksSane(id o);
+static NSArray    *PJQGIvarPatterns(void);
+static BOOL        PJQGNameMatchesPatterns(NSString *low, NSArray *pats);
+static NSString   *PJQGDiagnoseHead(id chatVC);
+static NSArray    *PJQGIvarCandidateNames(id obj, NSUInteger max);
 
 typedef NS_ENUM(NSInteger, PJQGKind) {
     PJQGKindGroup = 0,   // 群聊
@@ -393,6 +398,45 @@ static BOOL PJQGIsClassObjectSafely(id o) {
     @try { return class_isMetaClass(object_getClass(o)); } @catch (NSException *e) { return NO; }
 }
 
+// 从 ivar 里读出来的指针做一次廉价合理性检查，尽量避免拿野指针去调 isKindOfClass:（那是 SIGSEGV，@try 拦不住）
+static BOOL PJQGPointerLooksSane(id o) {
+    uintptr_t p = (uintptr_t)o;
+    if (p == 0) return NO;
+    if ((p & 0x8000000000000000ULL) != 0) return YES;   // objc tagged pointer，运行时自己会处理
+    if ((p & 0x7ULL) != 0) return NO;                   // 未对齐 → 基本可断定不是对象指针
+    if (p < 0x10000000ULL) return NO;                   // 明显不是堆/数据段指针
+    return YES;
+}
+
+// 只按「名字」筛出可能与会话/联系人相关的对象成员（不读内存，绝不抛异常）
+static NSArray *PJQGIvarCandidateNames(id obj, NSUInteger max) {
+    NSMutableArray *out = [NSMutableArray array];
+    if (!obj) return out;
+    @try {
+        int guard = 0;
+        for (Class k = [obj class]; k && k != Nil && guard++ < 12; k = class_getSuperclass(k)) {
+            unsigned int cnt = 0;
+            Ivar *ivs = class_copyIvarList(k, &cnt);
+            if (!ivs) continue;
+            for (unsigned int i = 0; i < cnt; i++) {
+                const char *nm = ivar_getName(ivs[i]);
+                const char *tt = ivar_getTypeEncoding(ivs[i]);
+                if (!nm || !tt || tt[0] != '@') continue;
+                NSString *name = [NSString stringWithUTF8String:nm];
+                if (!name) continue;
+                NSString *low = name.lowercaseString;
+                if (!PJQGNameMatchesPatterns(low, PJQGIvarPatterns()) &&
+                    ![low containsString:@"delegate"] &&
+                    ![low containsString:@"logic"]) continue;
+                [out addObject:name];
+                if (out.count >= max) { free(ivs); return out; }
+            }
+            free(ivs);
+        }
+    } @catch (NSException *e) { }
+    return out;
+}
+
 static NSMutableDictionary *gPJQGSelClassCache = nil;
 
 static NSArray *PJQGClassesImplementing(SEL sel) {
@@ -565,12 +609,15 @@ static NSArray *PJQGChatIdSelCandidates(void) {
 }
 
 static NSArray *PJQGChatIdChildKeyCandidates(void) {
-    return @[ @"m_logicController", @"logicController", @"m_oLogicController",
+    return @[ @"m_delegate", @"delegate", @"m_oDelegate", @"m_logicDelegate",
+              @"m_logicController", @"logicController", @"m_oLogicController",
               @"logicCtrl", @"m_logicCtrl", @"viewLogicController",
               @"m_oViewLogicController", @"logic", @"m_logic",
               @"m_chatLogicController", @"chatController", @"m_controller",
-              @"m_oContact", @"contact", @"m_contact", @"m_oSessionInfo",
-              @"sessionInfo", @"m_sessionInfo", @"m_oSession", @"session" ];
+              @"m_msgLogicController", @"m_oMsgLogicController", @"m_msgLogicManager",
+              @"m_oContact", @"m_ovChatContact", @"contact", @"m_contact",
+              @"m_oSessionInfo", @"sessionInfo", @"m_sessionInfo",
+              @"m_oSession", @"session", @"m_oChatViewModel", @"m_oLogicHelper" ];
 }
 
 static NSArray *PJQGIvarPatterns(void) {
@@ -632,7 +679,9 @@ static id PJQGSafeObjectForKey(id obj, NSString *key) {
         if (iv) {
             const char *te = ivar_getTypeEncoding(iv);
             if (!te || te[0] != '@') return nil;     // 标量成员不走这条路
-            return object_getIvar(obj, iv);
+            id v = object_getIvar(obj, iv);
+            if (v && !PJQGPointerLooksSane(v)) return nil;   // 野指针直接丢弃
+            return v;
         }
 
         // ② 确认真的有这个方法，且返回的是对象，才敢 KVC
@@ -693,7 +742,8 @@ static NSString *PJQGChatIdFromIvars(id obj, NSString **how) {
 
                 id v = nil;
                 @try { v = object_getIvar(obj, ivs[i]); } @catch (NSException *e) { continue; }
-                if (!v || ![v isKindOfClass:NSString.class]) continue;
+                if (!PJQGPointerLooksSane(v)) continue;
+                if (![v isKindOfClass:NSString.class]) continue;
                 NSString *sv = (NSString *)v;
                 if (sv.length == 0) continue;
 
@@ -793,6 +843,145 @@ static NSString *PJQGIvarHasName(id obj, NSString *fragment) {
     return nil;
 }
 
+#pragma mark - ⑦ 全局服务链 / ⑧ 消息回溯
+
+// 只在「类方法」里找单例访问器；三次尝试全部包 @try
+static id PJQGSingletonForClass(Class c) {
+    if (!c) return nil;
+    for (NSString *g in @[ @"defaultCenter", @"sharedInstance", @"sharedManager",
+                           @"defaultManager", @"shared", @"instance",
+                           @"defaultInstance", @"getInstance", @"sharedModel" ]) {
+        SEL s = NSSelectorFromString(g);
+        if (!s || !class_getClassMethod(c, s)) continue;
+        @try {
+            id v = ((id (*)(id, SEL))objc_msgSend)((id)c, s);
+            if (v && !PJQGIsClassObjectSafely(v) && [v isKindOfClass:NSObject.class]) return v;
+        } @catch (NSException *e) { } @catch (...) { }
+    }
+    return nil;
+}
+
+// 在一个「管理器 / 会话对象」上找会话 ID：先看自己的字符串成员，再钻名字像 session/current 的对象成员
+static NSString *PJQGChatIdFromServiceObject(id svc, NSString **how, NSMutableString *trace, NSString *tag) {
+    if (!svc) return nil;
+
+    for (NSString *k in PJQGChatIdKeyCandidates()) {
+        NSString *v = PJQGSafeStringForKey(svc, k, NULL);
+        if (v && PJQGLooksLikeChatIdScore(v) >= 15) {
+            if (how) *how = [NSString stringWithFormat:@"%@.%@", tag, k];
+            if (trace) [trace appendFormat:@"  ⑦ %@.%@ = %@  ✓\n", tag, k, v];
+            return v;
+        }
+    }
+
+    @try {
+        int guard = 0;
+        for (Class k = [svc class]; k && k != Nil && guard++ < 12; k = class_getSuperclass(k)) {
+            unsigned int cnt = 0;
+            Ivar *ivs = class_copyIvarList(k, &cnt);
+            if (!ivs) continue;
+            for (unsigned int i = 0; i < cnt; i++) {
+                const char *nm = ivar_getName(ivs[i]);
+                const char *tt = ivar_getTypeEncoding(ivs[i]);
+                if (!nm || !tt || tt[0] != '@') continue;
+                NSString *name = [NSString stringWithUTF8String:nm];
+                NSString *low  = name.lowercaseString;
+                if (!([low containsString:@"session"] || [low containsString:@"current"] ||
+                      [low containsString:@"last"]    || [low containsString:@"chat"] ||
+                      [low containsString:@"conversation"])) continue;
+
+                id v = nil;
+                @try { v = object_getIvar(svc, ivs[i]); } @catch (NSException *e) { continue; }
+                if (!PJQGPointerLooksSane(v)) continue;
+                if (PJQGIsClassObjectSafely(v)) continue;
+
+                NSString *r = PJQGUsrNameFromObject(v);
+                if (r && PJQGLooksLikeChatIdScore(r) >= 15) {
+                    if (how) *how = [NSString stringWithFormat:@"%@.%@→%@", tag, name, NSStringFromClass([v class])];
+                    if (trace) [trace appendFormat:@"  ⑦ %@.%@(→%@) = %@  ✓\n",
+                                tag, name, NSStringFromClass([v class]), r];
+                    return r;
+                }
+                NSString *r2 = PJQGChatIdFromIvars(v, NULL);
+                if (r2) {
+                    if (how) *how = [NSString stringWithFormat:@"%@.%@.ivar", tag, name];
+                    if (trace) [trace appendFormat:@"  ⑦ %@.%@(→%@) ivar = %@  ✓\n",
+                                tag, name, NSStringFromClass([v class]), r2];
+                    return r2;
+                }
+            }
+            free(ivs);
+        }
+    } @catch (NSException *e) { }
+    return nil;
+}
+
+static NSString *PJQGChatIdFromGlobalServices(NSString **how, NSMutableString *trace) {
+    NSArray *svcNames = @[ @"MMSessionInfoManager", @"MMMsgLogicManager", @"MMChatSessionManager",
+                           @"MMSessionRing", @"MMLogicMgr", @"MMUIManager", @"CUtility" ];
+    @try {
+        for (NSString *cn in svcNames) {
+            Class c = NSClassFromString(cn);
+            if (!c) continue;
+            id svc = PJQGSingletonForClass(c);
+            if (!svc) continue;
+            NSString *v = PJQGChatIdFromServiceObject(svc, how, trace, cn);
+            if (v) return v;
+        }
+
+        Class msc = NSClassFromString(@"MMServiceCenter");
+        if (msc) {
+            id center = PJQGSingletonForClass(msc);
+            SEL gs = NSSelectorFromString(@"getService:");
+            if (center && class_getInstanceMethod([center class], gs)) {
+                for (NSString *cn in svcNames) {
+                    Class sc = NSClassFromString(cn);
+                    if (!sc) continue;
+                    @try {
+                        id svc = ((id (*)(id, SEL, id))objc_msgSend)(center, gs, (id)sc);
+                        if (!svc || PJQGIsClassObjectSafely(svc)) continue;
+                        NSString *v = PJQGChatIdFromServiceObject(
+                            svc, how, trace, [NSString stringWithFormat:@"ServiceCenter/%@", cn]);
+                        if (v) return v;
+                    } @catch (NSException *e) { }
+                }
+            }
+        }
+    } @catch (NSException *e) {
+        if (trace) [trace appendFormat:@"  ⑦ 异常: %@\n", e.reason];
+    }
+    return nil;
+}
+
+// ⑧ 从当前会话的消息数组反推（消息里有 m_nsToUsr / m_nsFromUsr）
+static NSString *PJQGChatIdFromMessages(id vc, NSString **how, NSMutableString *trace) {
+    @try {
+        for (NSString *arrKey in @[ @"m_arrMessageNodeData", @"m_arrMsgData", @"m_arrMessages" ]) {
+            id arr = PJQGSafeObjectForKey(vc, arrKey);
+            if (!arr || PJQGIsClassObjectSafely(arr)) continue;
+            if (![arr isKindOfClass:NSArray.class]) continue;
+            NSArray *a = (NSArray *)arr;
+            if (a.count == 0) continue;
+
+            NSInteger lo = (NSInteger)a.count - 12;
+            if (lo < 0) lo = 0;
+            for (NSInteger idx = (NSInteger)a.count - 1; idx >= lo; idx--) {
+                id msg = a[(NSUInteger)idx];
+                if (!PJQGPointerLooksSane(msg) || PJQGIsClassObjectSafely(msg)) continue;
+                for (NSString *k in @[ @"m_nsToUsr", @"m_nsFromUsr", @"m_nsRealChatUsr",
+                                       @"m_nsChatName", @"m_nsUsrName" ]) {
+                    NSString *v = PJQGSafeStringForKey(msg, k, NULL);
+                    if (!v || PJQGLooksLikeChatIdScore(v) < 15) continue;
+                    if (how) *how = [NSString stringWithFormat:@"%@[%ld].%@", arrKey, (long)idx, k];
+                    if (trace) [trace appendFormat:@"  ⑧ %@[%ld].%@ = %@  ✓\n", arrKey, (long)idx, k, v];
+                    return v;
+                }
+            }
+        }
+    } @catch (NSException *e) { }
+    return nil;
+}
+
 static NSString *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace) {
     if (how) *how = nil;
     if (!vc) return nil;
@@ -875,13 +1064,29 @@ static NSString *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace) {
         if (trace) [trace appendFormat:@"  ⑤ %@ (%@) = 未取到\n", h, NSStringFromClass([child class])];
     }
 
-    // ⑥ 全局兜底 —— 只提示不自动使用（避免分错会话）
+    // ⑦ 微信全局服务链（会话管理器 / MMServiceCenter 中转）
+    {
+        NSString *how7 = nil;
+        NSString *v7 = PJQGChatIdFromGlobalServices(&how7, trace);
+        if (v7) { if (how) *how = how7 ?: @"全局服务链"; return v7; }
+        if (trace) [trace appendString:@"  ⑦ 全局服务链 = (无)\n"];
+    }
+
+    // ⑧ 消息回溯（消息对象里的收发方用户名就是最原始的会话 ID）
+    {
+        NSString *how8 = nil;
+        NSString *v8 = PJQGChatIdFromMessages(vc, &how8, trace);
+        if (v8) { if (how) *how = how8 ?: @"消息回溯"; return v8; }
+        if (trace) [trace appendString:@"  ⑧ 消息回溯 = (无)\n"];
+    }
+
+    // ⑨ 全局兜底 —— 只提示不自动使用（避免分错会话）
     if (trace) {
         if (gPJQGLastCapturedId.length)
-            [trace appendFormat:@"  ⑥ 全局捕获过 = %@ (%@)  ← 仅提示，不自动使用\n",
+            [trace appendFormat:@"  ⑨ 全局捕获过 = %@ (%@)  ← 仅提示，不自动使用\n",
                 gPJQGLastCapturedId, gPJQGLastCapturedHow ?: @"?"];
         else
-            [trace appendString:@"  ⑥ 全局捕获 = (无)\n"];
+            [trace appendString:@"  ⑨ 全局捕获 = (无)\n"];
     }
     return nil;
 }
@@ -1050,88 +1255,105 @@ static NSString *PJQGDiagnoseDetail(id chatVC) {
     [s appendString:@"日志落点候选（为何你找不到日志）:\n"];
     [s appendString:PJQGLogPathCandidates()];
 
-    [s appendString:@"\n--- MikotoHelper 是否已加载 ---\n"];
-    for (NSString *cn in @[ @"PJGroupDataModel", @"PJMisakaManager", @"PJGroupManager",
-                            @"PJManagerModel", @"PJHelper", @"PJPluginModel",
-                            @"PJGroupModel", @"PJSettingGroupVC" ]) {
-        [s appendFormat:@"  %@ : %@\n", cn, NSClassFromString(cn) ? @"✓ 存在" : @"✗ 不存在"];
-    }
+    // ★ 当前聊天窗口放在最前面：这是最关键的一段，后面任何一块炸了都不影响它
+    @try {
+        [s appendString:@"\n--- 当前聊天窗口 ---\n"];
+        if (chatVC) {
+            [s appendFormat:@"  类名: %@\n", NSStringFromClass([chatVC class])];
+            [s appendFormat:@"  匹配原因: %@\n", gPJQGLasMatchReason ?: @"?"];
+            [s appendFormat:@"  动态捕获: %@ (%@)\n",
+                objc_getAssociatedObject(chatVC, kPJQGCapturedIdKey) ?: @"(无)",
+                objc_getAssociatedObject(chatVC, kPJQGCapturedHowKey) ?: @"-"];
+            NSMutableString *tr = [NSMutableString string];
+            NSString *how = nil;
+            NSString *cid = PJQGChatIdEx(chatVC, &how, tr);
+            [s appendString:@"  识别过程:\n"];
+            [s appendString:tr];
+            [s appendFormat:@"  ⇒ 结果: %@  (来源 %@)\n\n", cid ?: @"(未取到)", how ?: @"-"];
 
-    [s appendString:@"\n--- 谁实现了这些方法 ---\n"];
-    for (NSString *sn in @[ @"addGroupData:", @"addChatData:", @"addOtherGroupData:",
-                            @"misaka_selectChatAction", @"rebuildMainSessions",
-                            @"chatIsChatAction:", @"groupIsChatAction:",
-                            @"MisakaGroupCreateWithSection:WithLogicController:WithDataSource:WithGroupDic:WithChatDic:WithOtherGroup:" ]) {
-        NSArray *cls = PJQGClassesImplementing(NSSelectorFromString(sn));
-        [s appendFormat:@"  %@\n      [%lu] %@\n", sn, (unsigned long)cls.count,
-            cls.count ? [cls componentsJoinedByString:@", "] : @"(无)"];
-    }
+            [s appendString:@"  成员变量名称全表（只读元数据，可据此定位会话ID字段）:\n"];
+            [s appendString:PJQGIvarNameTable(chatVC, 260)];
 
-    [s appendString:@"\n--- 方法签名（决定能不能调用） ---\n"];
-    for (NSString *sn in @[ @"addGroupData:", @"addChatData:", @"addOtherGroupData:",
-                            @"misaka_selectChatAction", @"rebuildMainSessions" ]) {
-        SEL sel = NSSelectorFromString(sn);
-        NSArray *cls = PJQGClassesImplementing(sel);
-        [s appendFormat:@"  · %@ (%lu 个类)\n", sn, (unsigned long)cls.count];
-        if (cls.count == 0) { [s appendString:@"      (无类实现)\n"]; continue; }
-        int shown = 0;
-        for (NSString *cn in cls) {
-            if (cls.count > 6 && ![cn hasPrefix:@"PJ"] && ![cn hasPrefix:@"Misaka"]) continue;
-            Class c = NSClassFromString(cn);
-            [s appendFormat:@"      %@\n", PJQGMethodInfo((id)c, sel)];
-            [s appendFormat:@"      %@\n", PJQGMethodInfo(c, sel)];
-            if (++shown >= 8) { [s appendString:@"      ...(截断)\n"]; break; }
+            [s appendString:@"  关键成员取值:\n"];
+            [s appendString:PJQGIvarValues(chatVC)];
+
+            NSString *logicIvar = PJQGIvarHasName(chatVC, @"logic");
+            NSString *contactIvar = PJQGIvarHasName(chatVC, @"contact");
+            [s appendFormat:@"  线索: logic 成员=%@  contact 成员=%@\n",
+                logicIvar ?: @"(无)", contactIvar ?: @"(无)"];
+        } else {
+            [s appendString:@"  (尚未进入聊天窗口)\n"];
         }
+    } @catch (NSException *e) {
+        [s appendFormat:@"  ⚠︎ 当前聊天窗口段异常: %@\n", e.reason];
     }
 
-    [s appendString:@"\n--- provider 解析 ---\n"];
-    for (NSString *sn in @[ @"addGroupData:", @"addChatData:", @"addOtherGroupData:", @"rebuildMainSessions" ]) {
-        NSString *how = nil;
-        id p = PJQGFindProvider(NSSelectorFromString(sn), &how);
-        [s appendFormat:@"  %@\n      %@  via %@\n", sn,
-            p ? NSStringFromClass([p class]) : @"(未找到)", how ?: @"-"];
+    @try {
+        [s appendString:@"\n--- MikotoHelper 是否已加载 ---\n"];
+        for (NSString *cn in @[ @"PJGroupDataModel", @"PJMisakaManager", @"PJGroupManager",
+                                @"PJManagerModel", @"PJHelper", @"PJPluginModel",
+                                @"PJGroupModel", @"PJSettingGroupVC" ]) {
+            [s appendFormat:@"  %@ : %@\n", cn, NSClassFromString(cn) ? @"✓ 存在" : @"✗ 不存在"];
+        }
+
+        [s appendString:@"\n--- 谁实现了这些方法 ---\n"];
+        for (NSString *sn in @[ @"addGroupData:", @"addChatData:", @"addOtherGroupData:",
+                                @"misaka_selectChatAction", @"rebuildMainSessions",
+                                @"chatIsChatAction:", @"groupIsChatAction:",
+                                @"MisakaGroupCreateWithSection:WithLogicController:WithDataSource:WithGroupDic:WithChatDic:WithOtherGroup:" ]) {
+            NSArray *cls = PJQGClassesImplementing(NSSelectorFromString(sn));
+            [s appendFormat:@"  %@\n      [%lu] %@\n", sn, (unsigned long)cls.count,
+                cls.count ? [cls componentsJoinedByString:@", "] : @"(无)"];
+        }
+
+        [s appendString:@"\n--- 方法签名（决定能不能调用） ---\n"];
+        for (NSString *sn in @[ @"addGroupData:", @"addChatData:", @"addOtherGroupData:",
+                                @"misaka_selectChatAction", @"rebuildMainSessions" ]) {
+            SEL sel = NSSelectorFromString(sn);
+            NSArray *cls = PJQGClassesImplementing(sel);
+            [s appendFormat:@"  · %@ (%lu 个类)\n", sn, (unsigned long)cls.count];
+            if (cls.count == 0) { [s appendString:@"      (无类实现)\n"]; continue; }
+            int shown = 0;
+            for (NSString *cn in cls) {
+                if (cls.count > 6 && ![cn hasPrefix:@"PJ"] && ![cn hasPrefix:@"Misaka"]) continue;
+                Class c = NSClassFromString(cn);
+                [s appendFormat:@"      %@\n", PJQGMethodInfo((id)c, sel)];
+                [s appendFormat:@"      %@\n", PJQGMethodInfo(c, sel)];
+                if (++shown >= 8) { [s appendString:@"      ...(截断)\n"]; break; }
+            }
+        }
+    } @catch (NSException *e) {
+        [s appendFormat:@"⚠︎ 类/方法探测段异常: %@\n", e.reason];
     }
 
-    [s appendString:@"\n--- PJ* 类清单 ---\n"];
-    NSArray *pj = PJQGClassNamesWithPrefix(@"PJ");
-    [s appendFormat:@"  PJ* 共 %lu 个\n", (unsigned long)pj.count];
-    for (NSString *prefix in @[ @"PJGroup", @"PJMisaka", @"PJTag", @"PJHelper", @"PJUtils", @"PJSetting" ]) {
-        NSMutableArray *hit = [NSMutableArray array];
-        for (NSString *n in pj) if ([n hasPrefix:prefix]) [hit addObject:n];
-        if (hit.count) [s appendFormat:@"  %@: %@\n", prefix, [hit componentsJoinedByString:@", "]];
+    // provider 解析会去调未知类的单例访问器（可能触发 +initialize 抛异常），单独 @try
+    @try {
+        [s appendString:@"\n--- provider 解析 ---\n"];
+        for (NSString *sn in @[ @"addGroupData:", @"addChatData:", @"addOtherGroupData:", @"rebuildMainSessions" ]) {
+            NSString *how = nil;
+            id p = PJQGFindProvider(NSSelectorFromString(sn), &how);
+            [s appendFormat:@"  %@\n      %@  via %@\n", sn,
+                p ? NSStringFromClass([p class]) : @"(未找到)", how ?: @"-"];
+        }
+    } @catch (NSException *e) {
+        [s appendFormat:@"⚠︎ provider 解析段异常: %@\n", e.reason];
     }
 
-    [s appendString:@"\n--- 当前聊天窗口 ---\n"];
-    if (chatVC) {
-        [s appendFormat:@"  类名: %@\n", NSStringFromClass([chatVC class])];
-        [s appendFormat:@"  匹配原因: %@\n", gPJQGLasMatchReason ?: @"?"];
-        [s appendFormat:@"  动态捕获: %@ (%@)\n",
-            objc_getAssociatedObject(chatVC, kPJQGCapturedIdKey) ?: @"(无)",
-            objc_getAssociatedObject(chatVC, kPJQGCapturedHowKey) ?: @"-"];
-        NSMutableString *tr = [NSMutableString string];
-        NSString *how = nil;
-        NSString *cid = PJQGChatIdEx(chatVC, &how, tr);
-        [s appendString:@"  识别过程:\n"];
-        [s appendString:tr];
-        [s appendFormat:@"  ⇒ 结果: %@  (来源 %@)\n\n", cid ?: @"(未取到)", how ?: @"-"];
-
-        [s appendString:@"  成员变量名称全表（只读元数据，可据此定位会话ID字段）:\n"];
-        [s appendString:PJQGIvarNameTable(chatVC, 260)];
-
-        [s appendString:@"  关键成员取值:\n"];
-        [s appendString:PJQGIvarValues(chatVC)];
-
-        NSString *logicIvar = PJQGIvarHasName(chatVC, @"logic");
-        NSString *contactIvar = PJQGIvarHasName(chatVC, @"contact");
-        [s appendFormat:@"  线索: logic 成员=%@  contact 成员=%@\n",
-            logicIvar ?: @"(无)", contactIvar ?: @"(无)"];
-    } else {
-        [s appendString:@"  (尚未进入聊天窗口)\n"];
-    }
+    @try {
+        [s appendString:@"\n--- PJ* 类清单 ---\n"];
+        NSArray *pj = PJQGClassNamesWithPrefix(@"PJ");
+        [s appendFormat:@"  PJ* 共 %lu 个\n", (unsigned long)pj.count];
+        for (NSString *prefix in @[ @"PJGroup", @"PJMisaka", @"PJTag", @"PJHelper", @"PJUtils", @"PJSetting" ]) {
+            NSMutableArray *hit = [NSMutableArray array];
+            for (NSString *n in pj) if ([n hasPrefix:prefix]) [hit addObject:n];
+            if (hit.count) [s appendFormat:@"  %@: %@\n", prefix, [hit componentsJoinedByString:@", "]];
+        }
+    } @catch (NSException *e) { }
 
     [s appendString:@"\n--- NSUserDefaults 相关键 ---\n"];
     int shown = 0;
-    NSDictionary *d = ud.dictionaryRepresentation;
+    NSDictionary *d = nil;
+    @try { d = ud.dictionaryRepresentation; } @catch (NSException *e) { }
     for (NSString *k in d.allKeys) {
         NSString *lk = k.lowercaseString;
         if ([lk containsString:@"pj"] || [lk containsString:@"mikoto"] ||
@@ -1218,20 +1440,127 @@ static NSString *PJQGDiagnoseMini(id chatVC) {
     return s;
 }
 
+// ---------------- ★ 关键结论（短版，专为「整段粘贴发回」设计） ----------------
+// 之前你贴回来的报告被聊天输入框截断了（142 条成员变量只到第 ~110 条）。
+// 这一段把「我下一步做判断所必需的信息」压到几十行，永远不会被截断。
+// 全部只走运行时元数据 + 受控取值，每块独立 @try，任何一块炸了都不影响其它块。
+static NSString *PJQGDiagnoseHead(id chatVC) {
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"##### 关键结论 v%@ #####\n", kPJQGVersion];
+
+    // 1) 窗口
+    @try {
+        [s appendFormat:@"窗口类   : %@\n", chatVC ? NSStringFromClass([chatVC class]) : @"(无)"];
+        [s appendFormat:@"匹配原因 : %@\n", gPJQGLasMatchReason ?: @"?"];
+        [s appendFormat:@"动态捕获 : %@ (%@)\n",
+            objc_getAssociatedObject(chatVC, kPJQGCapturedIdKey) ?: @"(无)",
+            objc_getAssociatedObject(chatVC, kPJQGCapturedHowKey) ?: @"-"];
+    } @catch (NSException *e) { }
+
+    // 2) 识别结果 + 完整识别链（哪一级命中/失败）
+    @try {
+        if (chatVC) {
+            NSMutableString *tr = [NSMutableString string];
+            NSString *how = nil;
+            NSString *cid = PJQGChatIdEx(chatVC, &how, tr);
+            [s appendFormat:@"识别结果 : %@   (来源 %@)\n", cid ?: @"(未取到)", how ?: @"-"];
+            [s appendString:@"识别链   :\n"];
+            [s appendString:tr];
+        } else {
+            [s appendString:@"识别结果 : (无聊天窗口)\n"];
+        }
+    } @catch (NSException *e) {
+        [s appendFormat:@"识别链   : ⚠︎ 异常 %@\n", e.reason];
+    }
+
+    // 3) MikotoHelper 是否已加载
+    @try {
+        [s appendString:@"Mikoto类 :"];
+        for (NSString *cn in @[ @"PJGroupDataModel", @"PJMisakaManager", @"PJGroupManager",
+                                @"PJManagerModel", @"PJHelper", @"PJMisakaSettingViewController" ]) {
+            [s appendFormat:@" %@=%@", cn, NSClassFromString(cn) ? @"✓" : @"✗"];
+        }
+        [s appendString:@"\n"];
+    } @catch (NSException *e) { }
+
+    // 4) 写入接口（provider 解析结果）
+    @try {
+        for (NSString *sn in @[ @"addGroupData:", @"addChatData:", @"addOtherGroupData:",
+                                @"rebuildMainSessions" ]) {
+            NSString *how = nil;
+            id p = PJQGFindProvider(NSSelectorFromString(sn), &how);
+            [s appendFormat:@"写入接口 : %@ → %@ (%@)\n", sn,
+                p ? NSStringFromClass([p class]) : @"(未找到)", how ?: @"-"];
+        }
+    } @catch (NSException *e) {
+        [s appendFormat:@"写入接口 : ⚠︎ 异常 %@\n", e.reason];
+    }
+
+    // 5) 会话 ID 候选字段（只看名字，不读内存）
+    @try {
+        NSArray *names = PJQGIvarCandidateNames(chatVC, 40);
+        [s appendFormat:@"候选字段 : %@\n",
+            names.count ? [names componentsJoinedByString:@", "] : @"(无)"];
+    } @catch (NSException *e) { }
+
+    // 6) 关键取值（只读候选里的对象成员，带野指针检查）
+    @try {
+        if (!PJQGDeepDiag()) {
+            [s appendString:@"关键取值 : (深度诊断关闭，未读取)\n"];
+        } else if (chatVC) {
+            NSArray *names = PJQGIvarCandidateNames(chatVC, 40);
+            NSMutableArray *lines = [NSMutableArray array];
+            for (NSString *n in names) {
+                if (lines.count >= 14) break;
+                id v = PJQGSafeObjectForKey(chatVC, n);
+                if (!v || ![v isKindOfClass:NSObject.class]) continue;
+                if ([v isKindOfClass:NSString.class]) {
+                    NSString *sv = (NSString *)v;
+                    if (sv.length == 0 || sv.length > 80) continue;
+                    [lines addObject:[NSString stringWithFormat:@"  %@ = \"%@\"", n, sv]];
+                } else {
+                    [lines addObject:[NSString stringWithFormat:@"  %@ : %@", n, NSStringFromClass([v class])]];
+                }
+            }
+            [s appendString:@"关键取值 :\n"];
+            [s appendString:lines.count ? [lines componentsJoinedByString:@"\n"] : @"  (无)"];
+            [s appendString:@"\n"];
+        }
+    } @catch (NSException *e) {
+        [s appendFormat:@"关键取值 : ⚠︎ 异常 %@\n", e.reason];
+    }
+
+    [s appendString:@"##### 以上整段复制发回即可 #####\n"];
+    return s;
+}
+
+// 自动复制时只复制「关键结论」段，避免再次被聊天输入框截断
+static NSString *PJQGHeadOnly(NSString *full) {
+    if (full.length == 0) return @"";
+    NSRange r = [full rangeOfString:@"\n\n########## 最小报告"];
+    if (r.location != NSNotFound) return [full substringToIndex:r.location];
+    return full;
+}
+
 static NSString *PJQGDiagnose(id chatVC) {
     NSMutableString *out = [NSMutableString string];
 
-    @try { [out appendString:PJQGDiagnoseMini(chatVC)]; }
-    @catch (NSException *e) { [out appendFormat:@"(最小报告也失败了: %@)\n", e.reason]; }
+    // 第一段：关键结论（短）
+    @try { [out appendString:PJQGDiagnoseHead(chatVC)]; }
+    @catch (NSException *e) { [out appendFormat:@"(关键结论段失败: %@)\n", e.reason]; }
 
-    [out appendString:@"\n\n########## 完整报告（尽力输出） ##########\n"];
+    // 第二段：最小报告（纯元数据，含成员变量全表）
     @try {
+        [out appendString:@"\n\n########## 最小报告（元数据） ##########\n"];
+        [out appendString:PJQGDiagnoseMini(chatVC)];
+    } @catch (NSException *e) { [out appendFormat:@"(最小报告失败: %@)\n", e.reason]; }
+
+    // 第三段：完整报告（尽力输出）
+    @try {
+        [out appendString:@"\n\n########## 完整报告（尽力输出） ##########\n"];
         [out appendString:PJQGDiagnoseDetail(chatVC)];
     } @catch (NSException *e) {
-        [out appendFormat:
-            @"⚠︎ 完整报告在此处中断: %@\n"
-             "（不影响上面「元数据」部分 —— 定位会话 ID 字段所需的信息已经在里面了，直接发我即可）\n",
-            e.reason ?: e.name];
+        [out appendFormat:@"⚠︎ 完整报告在此处中断: %@\n", e.reason ?: e.name];
     } @catch (...) {
         [out appendString:@"⚠︎ 完整报告中断：非 Objective-C 异常\n"];
     }
@@ -1250,6 +1579,7 @@ static NSString *PJQGDiagnose(id chatVC) {
 - (UIButton *)makeButton:(NSString *)title action:(SEL)sel;
 - (void)localToast:(NSString *)msg;
 - (void)onCopy;
+- (void)onCopyHead;
 - (void)onShare;
 - (void)onManual;
 - (void)onClose;
@@ -1297,10 +1627,11 @@ static NSString *PJQGDiagnose(id chatVC) {
     [self.view addSubview:_tv];
 
     NSMutableArray *btns = [NSMutableArray array];
+    [btns addObject:[self makeButton:@"复制结论" action:@selector(onCopyHead)]];
     [btns addObject:[self makeButton:@"复制全文" action:@selector(onCopy)]];
     [btns addObject:[self makeButton:@"分享"     action:@selector(onShare)]];
     if (self.onManualInput) {
-        [btns addObject:[self makeButton:@"输入会话ID" action:@selector(onManual)]];
+        [btns addObject:[self makeButton:@"输入ID" action:@selector(onManual)]];
     }
     [btns addObject:[self makeButton:@"关闭" action:@selector(onClose)]];
 
@@ -1314,7 +1645,7 @@ static NSString *PJQGDiagnose(id chatVC) {
 - (UIButton *)makeButton:(NSString *)title action:(SEL)sel {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     [b setTitle:title forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    b.titleLabel.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightMedium];
     b.layer.cornerRadius = 8;
     b.clipsToBounds = YES;
     if (@available(iOS 13.0, *)) b.backgroundColor = UIColor.tertiarySystemFillColor;
@@ -1328,8 +1659,8 @@ static NSString *PJQGDiagnose(id chatVC) {
     if (self.autoCopy) {
         self.autoCopy = NO;
         @try {
-            UIPasteboard.generalPasteboard.string = self.reportText ?: @"";
-            [self localToast:@"诊断报告已复制到剪贴板，可直接粘贴发送"];
+            UIPasteboard.generalPasteboard.string = PJQGHeadOnly(self.reportText ?: @"");
+            [self localToast:@"已自动复制「关键结论」，直接粘贴发回即可"];
         } @catch (NSException *e) { }
     }
 }
@@ -1369,17 +1700,35 @@ static NSString *PJQGDiagnose(id chatVC) {
                      completion:^(BOOL f) { [l removeFromSuperview]; }];
 }
 
+- (void)onCopyHead {
+    @try {
+        UIPasteboard.generalPasteboard.string = PJQGHeadOnly(self.reportText ?: @"");
+        [self localToast:@"已复制「关键结论」，直接粘贴发回即可"];
+    } @catch (NSException *e) { }
+}
+
 - (void)onCopy {
     @try {
         UIPasteboard.generalPasteboard.string = self.reportText ?: @"";
-        [self localToast:@"已复制全部内容"];
+        [self localToast:@"已复制全部内容（较长，建议改用「分享」发文件）"];
     } @catch (NSException *e) { }
 }
 
 - (void)onShare {
     @try {
+        // 报告动辄上万字，粘贴容易被截断；这里优先「分享成一个 txt 文件」
+        NSString *text = self.reportText ?: @"";
+        NSURL *fileURL = nil;
+        @try {
+            NSString *p = [NSTemporaryDirectory() stringByAppendingPathComponent:@"MikotoQuickGroup_report.txt"];
+            if ([text writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL]) {
+                fileURL = [NSURL fileURLWithPath:p];
+            }
+        } @catch (NSException *e) { }
+
+        NSArray *items = fileURL ? @[fileURL, text] : @[text];
         UIActivityViewController *a =
-            [[UIActivityViewController alloc] initWithActivityItems:@[self.reportText ?: @""]
+            [[UIActivityViewController alloc] initWithActivityItems:items
                                               applicationActivities:nil];
         if (@available(iOS 8.0, *)) {
             a.popoverPresentationController.sourceView = self.view;
@@ -1455,7 +1804,8 @@ static void PJQGShowReportForHost(UIViewController *host, BOOL autoCopy, void (^
     @catch (NSException *e) { rep = [NSString stringWithFormat:@"生成诊断报告失败: %@", e.reason]; }
     PJQGLog(@"[report] 生成完毕，长度 %lu", (unsigned long)rep.length);
     if (autoCopy) {
-        @try { UIPasteboard.generalPasteboard.string = rep ?: @""; } @catch (NSException *e) { }
+        // 只复制「关键结论」段 —— 全文太长会被聊天输入框截断（上一版就是这么丢数据的）
+        @try { UIPasteboard.generalPasteboard.string = PJQGHeadOnly(rep ?: @""); } @catch (NSException *e) { }
     }
     PJQGShowReport(host, rep, autoCopy, onManual);
 }

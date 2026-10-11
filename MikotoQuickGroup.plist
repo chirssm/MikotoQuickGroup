@@ -1,1 +1,1 @@
-{ Filter = { Bundles = ( "com.tencent.xin", "com.tencent.xinWeChat", "com.tencent.xin.debug", "com.tencent.xin.dev" ); }; }
+{ Filter = { Bundles = ( "com.tencent.xin", "com.tencent.xin4", "com.tencent.xin5", "com.tencent.xinWeChat", "com.tencent.xin.debug", "com.tencent.xin.dev" ); Executables = ( "WeChat" ); }; }

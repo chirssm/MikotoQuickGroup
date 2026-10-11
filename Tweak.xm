@@ -1029,9 +1029,10 @@ static NSString *PJQGWriteReportFile(NSString *text, NSString *tag) {
         NSString *logPath = PJQGLogPath();
         if (logPath.length == 0) return nil;
         NSString *dir = [logPath stringByDeletingLastPathComponent];
-        NSString *name = [NSString stringWithFormat:@"pjqg_%@_%@.txt",
-                          tag ?: @"report",
-                          [[NSDate date] description].stringByReplacingOccurrencesOfString:@" " withString:@"_"];
+        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"MMdd_HHmmss";
+        NSString *stamp = [fmt stringFromDate:[NSDate date]] ?: @"now";
+        NSString *name = [NSString stringWithFormat:@"pjqg_%@_%@.txt", tag ?: @"report", stamp];
         NSString *p = [dir stringByAppendingPathComponent:name];
         [text writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
         PJQGLog(@"[report] 已落盘 %@", p);
@@ -2051,7 +2052,7 @@ static NSString *PJQGProbeMikotoGroup(void) {
             int before = PJQGMethodCount(c);
             PJQGEnsureClassReady(c);
             int after = PJQGMethodCount(c);
-            [s appendFormat:@"  %-34s 方法数 %d → %d%s\n", cn.UTF8String, before, after,
+            [s appendFormat:@"  %-34s 方法数 %d → %d%@\n", cn.UTF8String, before, after,
                 (before == 0 && after > 0) ? @"   ← 动态注册，现已就绪" : @""];
         }
     } @catch (NSException *e) { [s appendFormat:@"  (A 段异常: %@)\n", e.reason]; }

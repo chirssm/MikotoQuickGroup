@@ -1,6 +1,6 @@
 Package: com.pj.mikotoquickgroup
 Name: MikotoQuickGroup
-Version: 1.0.0
+Version: 1.1.0
 Architecture: iphoneos-arm64
 Description: 独立插件 —— 在微信聊天界面提供「快速分组」按钮，一键把当前会话归入 MikotoHelper 的指定分组（默认分组记忆）
 Maintainer: local

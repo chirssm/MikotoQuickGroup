@@ -1863,7 +1863,7 @@ typedef void (*PJQGMSHookMessageEx_t)(Class, SEL, IMP, IMP *);
 
 static PJQGMSHookMessageEx_t gPJQGMSHook = NULL;
 static BOOL                  gPJQGHookProbed = NO;
-static NSMutableDictionary  *gPJQGHookTable = nil;   // "Cls|sel" -> NSValue(IMP)
+static NSMutableDictionary  *gPJQGHookTable = nil;   // "Cls|sel" -> NSNumber(uintptr_t) 原始 IMP
 
 static BOOL PJQGClassHasOwnMethod(Class k, SEL s);
 
@@ -1874,8 +1874,8 @@ static IMP PJQGOrigIMPFor(id self, SEL _cmd) {
     int guard = 0;
     while (k && guard++ < 12) {
         NSString *key = [NSString stringWithFormat:@"%s|%@", class_getName(k), sn];
-        NSValue *v = gPJQGHookTable[key];
-        if (v) return (IMP)v.pointerValue;
+        NSNumber *v = gPJQGHookTable[key];
+        if (v) return (IMP)(uintptr_t)v.unsignedLongLongValue;
         k = class_getSuperclass(k);
     }
     return NULL;
@@ -1929,7 +1929,7 @@ static void PJQGHookSetters(Class cls) {
                 IMP orig = NULL;
                 gPJQGMSHook(k, s, (IMP)PJQGHookSetter, &orig);
                 if (orig) {
-                    gPJQGHookTable[key] = [NSValue valueWithPointer:orig];
+                    gPJQGHookTable[key] = [NSNumber numberWithUnsignedLongLong:(unsigned long long)(uintptr_t)orig];
                     PJQGLog(@"[hook] 已捕获 %s %@", class_getName(k), sn);
                 } else {
                     PJQGLog(@"[hook] %s %@ 原实现为空，跳过", class_getName(k), sn);

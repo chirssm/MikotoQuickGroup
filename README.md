@@ -16,8 +16,28 @@
 | **v1.3** | 「**提示未能识别当前会话，且找不到诊断报告**」 | **报告随手可得（自动弹出 + 自动复制）+ 会话 ID 七级识别 + 动态捕获 + 手动输入兜底** |
 | **v1.4** | 「**诊断报告只显示"生成诊断报告失败：Property Name should be baseResponse"**」 | **报告改为两段式（最小报告保证输出 + 完整报告尽力输出）；KVC 改为"成员变量直读优先"；消除裸 `respondsToSelector:`** |
 | **v1.5** | 「**报告能出来了，但内容被聊天输入框截断；按钮仍然只是弹报告、没能真正分组**」 | **① 报告最前面加「关键结论」短段（几十行，整段粘贴不会被截断）；② 自动复制只复制这一段；③ 分享改为直接分享 txt 文件；④ 会话 ID 再加两级来源（微信全局服务链 + 消息回溯）；⑤ 完整报告每块独立 `@try`，「当前聊天窗口」段提到最前** |
+| **v1.6** | 「**现在点了分组都没有反应了**」（比 v1.4 还糟：v1.4 至少弹报告，v1.5 什么都不出） | **① 点击后立刻在屏幕上画一条「已响应」提示（HUD），从此不可能再「没反应」；② 报告页/对话框全部改用独立 `UIWindow`（不再依赖 `presentViewController:`，消除静默失败）；③ 把 v1.5 新加的「微信全局服务链」从点击路径移出，默认关闭，只在长按菜单里显式开启；④ 单例探测加「返回类型必须是对象」校验（否则非对象返回值当 id 用会 SIGSEGV，`@try` 拦不住）；⑤ 新增会话 ID 来源「单条消息对象」；⑥ 长按菜单新增「自检」** |
 
-### v1.5 的 5 项改动（本次重点）
+### v1.6 的 6 项改动（本次重点）
+
+v1.5 反馈：**点了「分组」完全没反应**。
+
+先用 git 拉 v1.4 源码与 v1.5 逐行比对，得到一个很硬的结论：
+
+> **`onTap:` / `PJQGToast` / `PJQGShowReport` / `reportForMissingChatId` / `presentPickerSetDefault:` / `installBubble` 这些「点击 → 弹界面」的代码，v1.4 与 v1.5 一个字节都没改。**
+
+所以「没反应」不是弹窗被改坏了，只能是**识别阶段**变了——而 v1.5 唯一动过的就是 `PJQGChatIdEx` 新增的 **⑦ 全局服务链**。它在 v1.4 里只存在于报告页，v1.5 被搬到了**点击路径**上，会去调 `MMSessionInfoManager` / `MMMsgLogicManager` / `MMServiceCenter getService:` 这些微信核心单例。在主线程上做这种重型探测，结果就是**卡住（界面冻住＝「没反应」）**，或者拿到非对象返回值直接 **SIGSEGV**。
+
+| # | 根因 | v1.6 的处理 |
+|---|---|---|
+| 1 | 点击路径上新增了「碰微信核心单例」的探测 | ⑦ 全局服务链**移出默认路径**，改为 `PJQGDeepIdentify()`（默认 **NO**），只能在长按菜单里手动开 |
+| 2 | `PJQGSingletonForClass` 把 `objc_msgSend` 的返回值直接当 `id` 用 | 调用前**强制校验 `method_getReturnType == '@'` 且无额外参数**；`PJQGFindProvider` 的单例循环同样加固，并改用 `class_getInstanceMethod` 取代会触发 `+initialize` 的 `respondsToSelector:` |
+| 3 | 无论哪一步失败，屏幕上什么都看不到 | **点击后 0.12 秒先画 HUD**：「分组 ✓ 已响应 · 正在识别会话…」。之后每个分支都继续写 HUD（识别到 / 未识别到 / 正在写入 / ✅ 成功 / ❌ 失败原因）。**只要按钮活着，就一定有可见反馈**；连这条都不出现 → 说明插件根本没加载 |
+| 4 | `[host presentViewController:]` 在宿主层级不巧时**静默失败** | 报告页、菜单、选择器、手动输入、兜底提示全部改走**独立 `UIWindow`**（`UIWindowLevelAlert+50`，报告页直接当 root，不走 present）。HUD 用另一层 `userInteractionEnabled=NO` 的穿透窗口 |
+| 5 | 单聊里 `m_nsToUsr` 可能等于「我自己」 | 新增 ④·5「单条消息对象」（`m_lastMsgInNewArray` / `m_firstUnReadMsg` / `m_scrollTargetMsg` …）。取值规则：`m_nsRealChatUsr` 直接用；其它字段**只在值带 `@chatroom`/`@openim` 时才接受**，避免把账号自己当成会话 |
+| 6 | 出问题时拿不到线索 | 长按菜单新增「**自检**」：版本号、开关状态、微信版本、聊天窗口类、MikotoHelper 类清单、写入接口 provider、**会话识别全过程（逐级命中）**，一次性打出来并**自动复制到剪贴板** |
+
+### v1.5 的 5 项改动
 
 v1.4 反馈：**报告出来了**（拿到了 `BaseMsgContentViewController` 的 142 个成员变量），但——
 ① 粘贴到聊天框时**被输入框长度限制截断**（只到第 ~110 条）；

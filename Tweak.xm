@@ -46,13 +46,17 @@
 
 #pragma mark - 常量
 
-static NSString *const kPJQGVersion          = @"1.5";
+static NSString *const kPJQGVersion          = @"1.6";
 static NSString *const kPJQGDefaultKindKey   = @"pjqg_default_kind";   // NSInteger, -1 = 未设置
 static NSString *const kPJQGBubbleVisibleKey = @"pjqg_bubble_visible";
 static NSString *const kPJQGSilentKey        = @"pjqg_silent_alert";
 static NSString *const kPJQGRiskyFlagKey     = @"pjqg_risky_open";     // 危险调用哨兵
 static NSString *const kPJQGSafeModeKey      = @"pjqg_safe_mode";
 static NSString *const kPJQGDeepDiagKey      = @"pjqg_deep_diag";      // 是否读取对象成员变量
+// v1.6 新增：是否允许「碰微信全局单例」的深度识别（默认 NO）。
+// v1.5 的教训：把 MMServiceCenter/MMSessionInfoManager 这类核心单例探测放进点击路径后，
+// 点一下按钮就完全没反应（要么卡住主线程，要么拿到非对象返回值直接 SIGSEGV）。
+static NSString *const kPJQGDeepIdentifyKey  = @"pjqg_deep_identify";
 
 static const void *kPJQGActionKey       = &kPJQGActionKey;
 static const void *kPJQGBubbleKey       = &kPJQGBubbleKey;
@@ -66,6 +70,15 @@ static BOOL        PJQGIsClassObjectSafely(id o);
 static NSString   *PJQGLogPath(void);
 static void        PJQGLog(NSString *fmt, ...);
 static void        PJQGToast(UIView *host, NSString *text);
+// v1.6：独立窗口 —— 点击后立刻可见的 HUD + 不依赖 present 的面板（报告页/对话框）
+static void        PJQGHUD(NSString *text, BOOL sticky);
+static void        PJQGHUDHide(void);
+static void        PJQGShowPanel(UIViewController *vc);
+static void        PJQGHidePanel(void);
+static void        PJQGAlert(NSString *title, NSString *msg, NSString *copyText);
+static UIViewController *PJQGAlertHost(void);
+static void        PJQGPresentOnPanel(UIViewController *vc);
+static BOOL        PJQGDeepIdentify(void);
 static NSString   *PJQGUsrNameFromObject(id o);
 static NSString   *PJQGChatId(id vc, NSString **how);
 static NSString   *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace);
@@ -351,6 +364,19 @@ static void PJQGSetDeepDiag(BOOL v) {
     [d synchronize];
 }
 
+// v1.6：默认关闭。打开后才会去碰微信的全局单例（MMServiceCenter 等）。
+// 那是「最后手段」，代价是可能卡主线程甚至闪退，所以必须由用户显式开关。
+static BOOL PJQGDeepIdentify(void) {
+    NSNumber *n = [[NSUserDefaults standardUserDefaults] objectForKey:kPJQGDeepIdentifyKey];
+    return n ? n.boolValue : NO;
+}
+
+static void PJQGSetDeepIdentify(BOOL v) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    [d setBool:v forKey:kPJQGDeepIdentifyKey];
+    [d synchronize];
+}
+
 #pragma mark - 轻量 Toast
 
 static void PJQGToast(UIView *host, NSString *text) {
@@ -387,6 +413,230 @@ static void PJQGToast(UIView *host, NSString *text) {
                                  animations:^{ l.alpha = 0.0; }
                                  completion:^(BOOL f2) { [l removeFromSuperview]; }];
             }];
+        } @catch (NSException *e) { }
+    });
+}
+
+#pragma mark - 独立窗口：HUD 与面板（v1.6 新增）
+
+// ---------------------------------------------------------------------------
+// 为什么要自己开 UIWindow？
+// v1.4/v1.5 用的是 [某个 VC presentViewController:]。只要宿主 VC 不在窗口层级里、
+// 或者正处在 transition / isBeingDismissed，UIKit 会「静默失败」——不抛异常、也没有
+// 任何界面，表现就是「点了按钮完全没反应」。自己开一个 window 并把 VC 当作 root，
+// 完全不经过 present 链，没有这种失败模式。
+// ---------------------------------------------------------------------------
+
+static UIWindow       *gPJQGHUDWindow    = nil;   // 只放 HUD，userInteractionEnabled=NO（点击穿透）
+static UIWindow       *gPJQGPanelWindow  = nil;   // 报告页 / 对话框
+static UIViewController *gPJQGPanelHome  = nil;   // 面板窗口的常驻空壳 root
+static UILabel        *gPJQGHUDLabel     = nil;
+static NSInteger       gPJQGHUDGen       = 0;
+
+static UIWindow *PJQGHUDWindowRef(void) {
+    if (gPJQGHUDWindow) return gPJQGHUDWindow;
+    @try {
+        UIWindow *w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+        w.windowLevel = UIWindowLevelAlert + 100;
+        w.backgroundColor = [UIColor clearColor];
+        w.userInteractionEnabled = NO;          // 关键：让触摸穿透过去，不影响微信
+        w.rootViewController = [[UIViewController alloc] init];
+        gPJQGHUDWindow = w;
+    } @catch (NSException *e) { }
+    return gPJQGHUDWindow;
+}
+
+// 屏幕下方的小提示条。sticky=YES 时不自动消失（用于「处理中…」这类需要被替换的提示）。
+static void PJQGHUD(NSString *text, BOOL sticky) {
+    NSString *t = [text copy];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            UIWindow *w = PJQGHUDWindowRef();
+            if (!w) return;
+            UILabel *l = gPJQGHUDLabel;
+            if (!l) {
+                l = [[UILabel alloc] init];
+                l.numberOfLines = 0;
+                l.textAlignment = NSTextAlignmentCenter;
+                l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+                l.textColor = UIColor.whiteColor;
+                l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.86];
+                l.layer.cornerRadius = 10;
+                l.clipsToBounds = YES;
+                [w addSubview:l];
+                gPJQGHUDLabel = l;
+            }
+            l.text = t;
+            CGSize sz = [l sizeThatFits:CGSizeMake(w.bounds.size.width - 60, CGFLOAT_MAX)];
+            l.frame = CGRectMake(0, 0, sz.width + 36, sz.height + 22);
+            l.center = CGPointMake(w.bounds.size.width / 2, w.bounds.size.height * 0.72);
+            l.hidden = NO;
+            l.alpha = 1.0;
+            w.hidden = NO;
+            [w bringSubviewToFront:l];
+
+            NSInteger myGen = ++gPJQGHUDGen;
+            if (!sticky) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    @try {
+                        if (myGen != gPJQGHUDGen) return;      // 已被新的 HUD 取代
+                        UILabel *cur = gPJQGHUDLabel;
+                        if (!cur) return;
+                        [UIView animateWithDuration:0.25 animations:^{ cur.alpha = 0.0; }
+                                         completion:^(BOOL f) {
+                            if (myGen != gPJQGHUDGen) return;
+                            cur.hidden = YES;
+                            gPJQGHUDWindow.hidden = YES;
+                        }];
+                    } @catch (NSException *e) { }
+                });
+            }
+        } @catch (NSException *e) { }
+    });
+}
+
+static void PJQGHUDHide(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            gPJQGHUDGen++;
+            gPJQGHUDLabel.hidden = YES;
+            gPJQGHUDWindow.hidden = YES;
+        } @catch (NSException *e) { }
+    });
+}
+
+static UIWindow *PJQGPanelWindowRef(void) {
+    if (gPJQGPanelWindow) return gPJQGPanelWindow;
+    @try {
+        UIWindow *w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+        w.windowLevel = UIWindowLevelAlert + 50;      // 比 HUD 低
+        w.backgroundColor = [UIColor clearColor];
+        gPJQGPanelHome = [[UIViewController alloc] init];
+        w.rootViewController = gPJQGPanelHome;
+        gPJQGPanelWindow = w;
+    } @catch (NSException *e) { }
+    return gPJQGPanelWindow;
+}
+
+// 把任意 VC 直接当作面板窗口的 root 推上屏 —— 不走 present，永远不会被冲突吞掉
+static void PJQGShowPanel(UIViewController *vc) {
+    if (!vc) return;
+    UIWindow *w = PJQGPanelWindowRef();
+    if (!w) return;
+    @try {
+        PJQGHUDHide();                                  // 面板要上屏了，先把 HUD 收掉
+        if (!gPJQGPanelHome) gPJQGPanelHome = [[UIViewController alloc] init];
+        w.rootViewController = vc;
+        w.hidden = NO;
+        [w makeKeyAndVisible];
+    } @catch (NSException *e) { }
+}
+
+static void PJQGHidePanel(void) {
+    @try {
+        UIWindow *w = gPJQGPanelWindow;
+        if (!w) return;
+        if (!gPJQGPanelHome) gPJQGPanelHome = [[UIViewController alloc] init];
+        w.rootViewController = gPJQGPanelHome;
+        w.hidden = YES;
+    } @catch (NSException *e) { }
+}
+
+// 拿一个「一定在屏幕上、且当前没有别的弹窗」的宿主 VC，用来 present 对话框。
+// 面板窗口的 root 满足这两个条件；它平时是空的、透明的。
+static UIViewController *PJQGAlertHost(void) {
+    @try {
+        UIWindow *w = PJQGPanelWindowRef();
+        if (w) {
+            if (!w.rootViewController) {
+                gPJQGPanelHome = [[UIViewController alloc] init];
+                w.rootViewController = gPJQGPanelHome;
+            }
+            w.hidden = NO;
+            [w makeKeyAndVisible];
+            UIViewController *h = w.rootViewController;
+            if (h && !h.presentedViewController) return h;
+            if (h) {
+                UIViewController *p = h.presentedViewController;
+                int g = 0;
+                while (p.presentedViewController && g++ < 6) p = p.presentedViewController;
+                return p;
+            }
+        }
+    } @catch (NSException *e) { }
+    // 退路：原来的 keyWindow 方案
+    for (UIWindow *win in UIApplication.sharedApplication.windows) {
+        if (win.isKeyWindow) return win.rootViewController;
+    }
+    return nil;
+}
+
+// 弹窗消失后收起面板窗口（轮询实现，用普通 C 函数做递归，避免 block 自捕获的老坑）
+static UIViewController *gPJQGWatchHost  = nil;
+static int               gPJQGWatchTicks = 0;
+static void PJQGPanelWatchTick(void);
+
+static void PJQGPanelWatchStart(UIViewController *host) {
+    gPJQGWatchHost = host;
+    gPJQGWatchTicks = 0;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ @try { PJQGPanelWatchTick(); } @catch (NSException *e) { } });
+}
+
+static void PJQGPanelWatchTick(void) {
+    UIViewController *h = gPJQGWatchHost;
+    if (!h) return;
+    if (!h.presentedViewController) {
+        gPJQGWatchHost = nil;
+        if (gPJQGPanelWindow && gPJQGPanelWindow.rootViewController == gPJQGPanelHome) {
+            PJQGHidePanel();
+        }
+        return;
+    }
+    if (++gPJQGWatchTicks > 150) { gPJQGWatchHost = nil; return; }   // 最多等 ~60 秒
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ @try { PJQGPanelWatchTick(); } @catch (NSException *e) { } });
+}
+
+// 面板窗口上弹对话框，并在它消失后自动把面板窗口收起来（否则那层空窗口会挡住微信的点击）
+static void PJQGPresentOnPanel(UIViewController *vc) {
+    if (!vc) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            UIViewController *host = PJQGAlertHost();
+            if (!host) return;
+            if (host.presentedViewController) return;      // 已经有弹窗了，不叠
+            [host presentViewController:vc animated:YES completion:nil];
+            PJQGPanelWatchStart(host);
+        } @catch (NSException *e) { }
+    });
+}
+
+// 最后的兜底：只要还能建 UIWindow，就一定有界面。
+// copyText 非空时给一个「复制全文」按钮，方便直接把诊断信息发回。
+static void PJQGAlert(NSString *title, NSString *msg, NSString *copyText) {
+    NSString *t = [title copy];
+    NSString *m = [msg copy];
+    NSString *c = [copyText copy];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            UIViewController *host = PJQGAlertHost();
+            if (!host) return;
+            if (host.presentedViewController) return;
+            UIAlertController *al = [UIAlertController alertControllerWithTitle:t
+                                    message:m preferredStyle:UIAlertControllerStyleAlert];
+            if (c.length) {
+                [al addAction:[UIAlertAction actionWithTitle:@"复制全文"
+                                    style:UIAlertActionStyleDefault
+                                    handler:^(UIAlertAction *a) {
+                    @try { UIPasteboard.generalPasteboard.string = c; } @catch (NSException *e) { }
+                }]];
+            }
+            [al addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel
+                                handler:nil]];
+            [host presentViewController:al animated:YES completion:nil];
+            PJQGPanelWatchStart(host);
         } @catch (NSException *e) { }
     });
 }
@@ -845,17 +1095,34 @@ static NSString *PJQGIvarHasName(id obj, NSString *fragment) {
 
 #pragma mark - ⑦ 全局服务链 / ⑧ 消息回溯
 
-// 只在「类方法」里找单例访问器；三次尝试全部包 @try
+// 只在「类方法」里找单例访问器。
+// ★ v1.6 关键加固：调用前必须确认该方法的「返回类型是对象 且 没有额外参数」。
+//   v1.5 没做这一步，直接 objc_msgSend 拿返回值当 id 用：如果那个 +shared/+instance
+//   其实返回 BOOL/int，返回的就是个 0/1 之类的非指针，随后 isKindOfClass: 解引用
+//   非法地址 → SIGSEGV，@try 完全拦不住 → 微信直接挂掉 / 表现为「点了没反应」。
 static id PJQGSingletonForClass(Class c) {
     if (!c) return nil;
     for (NSString *g in @[ @"defaultCenter", @"sharedInstance", @"sharedManager",
                            @"defaultManager", @"shared", @"instance",
                            @"defaultInstance", @"getInstance", @"sharedModel" ]) {
         SEL s = NSSelectorFromString(g);
-        if (!s || !class_getClassMethod(c, s)) continue;
+        if (!s) continue;
+        Method m = class_getClassMethod(c, s);
+        if (!m) continue;
+
+        // 返回类型必须恰好是对象
+        char rt[16] = {0};
+        method_getReturnType(m, rt, sizeof(rt));
+        if (rt[0] != '@') continue;
+        // 只能是无参方法（class 方法本身占 self/_cmd 两个位置参数）
+        if (method_getNumberOfArguments(m) != 2) continue;
+
         @try {
             id v = ((id (*)(id, SEL))objc_msgSend)((id)c, s);
-            if (v && !PJQGIsClassObjectSafely(v) && [v isKindOfClass:NSObject.class]) return v;
+            if (!v) continue;
+            if (!PJQGPointerLooksSane(v)) continue;
+            if (PJQGIsClassObjectSafely(v)) continue;      // 拿到的是类对象，不要
+            if ([v isKindOfClass:NSObject.class]) return v;
         } @catch (NSException *e) { } @catch (...) { }
     }
     return nil;
@@ -953,10 +1220,56 @@ static NSString *PJQGChatIdFromGlobalServices(NSString **how, NSMutableString *t
     return nil;
 }
 
-// ⑧ 从当前会话的消息数组反推（消息里有 m_nsToUsr / m_nsFromUsr）
+// 从一个「消息对象」里安全地取出会话 ID。
+// 规则（很重要，否则会把「我自己」当成会话）：
+//   · m_nsRealChatUsr 是微信专门保存的「真实会话用户名」，与消息方向无关 → 直接采用
+//   · m_nsFromUsr / m_nsToUsr 在不同方向下会互换（单聊里 m_nsToUsr 甚至等于我自己的号），
+//     所以只有当值本身带 @chatroom / @openim 这种「无歧义」特征时才接受
+static NSString *PJQGChatIdFromMessageObject(id msg, NSString **how, NSMutableString *trace, NSString *tag) {
+    if (!msg || !PJQGPointerLooksSane(msg) || PJQGIsClassObjectSafely(msg)) return nil;
+    @try {
+        NSString *real = PJQGSafeStringForKey(msg, @"m_nsRealChatUsr", NULL);
+        if (real.length && PJQGLooksLikeChatIdScore(real) >= 15) {
+            if (how) *how = [NSString stringWithFormat:@"%@.m_nsRealChatUsr", tag];
+            if (trace) [trace appendFormat:@"  %@.m_nsRealChatUsr = %@  ✓\n", tag, real];
+            return real;
+        }
+        for (NSString *f in @[ @"m_nsFromUsr", @"m_nsToUsr", @"m_nsChatName",
+                               @"m_nsChatRoomUserName", @"m_nsUsrName" ]) {
+            NSString *v = PJQGSafeStringForKey(msg, f, NULL);
+            if (!v) continue;
+            if (!([v containsString:@"@chatroom"] || [v containsString:@"@openim"])) continue;
+            if (how) *how = [NSString stringWithFormat:@"%@.%@", tag, f];
+            if (trace) [trace appendFormat:@"  %@.%@ = %@  ✓\n", tag, f, v];
+            return v;
+        }
+    } @catch (NSException *e) { }
+    return nil;
+}
+
+// ④·5 聊天窗口自己持有的「单条消息对象」（报告里能看到 m_lastMsgInNewArray / m_firstUnReadMsg
+//      / m_scrollTargetMsg 等，类型都是 CMessageWrap）—— 会话里必然有消息，命中率高且完全安全
+static NSString *PJQGChatIdFromSingleMsgIvars(id vc, NSString **how, NSMutableString *trace) {
+    static NSArray *keys = nil;
+    if (!keys) keys = @[ @"m_lastMsgInNewArray", @"m_firstUnReadMsg", @"m_scrollTargetMsg",
+                         @"m_currentSpeakTextMsg", @"m_referOwnerMsg", @"m_referKeeperMsg",
+                         @"m_lastScrollingHandledMessage" ];
+    @try {
+        for (NSString *k in keys) {
+            id msg = PJQGSafeObjectForKey(vc, k);
+            if (!msg) continue;
+            NSString *v = PJQGChatIdFromMessageObject(msg, how, trace, k);
+            if (v) return v;
+        }
+    } @catch (NSException *e) { }
+    return nil;
+}
+
+// ⑧ 从当前会话的消息数组反推
 static NSString *PJQGChatIdFromMessages(id vc, NSString **how, NSMutableString *trace) {
     @try {
-        for (NSString *arrKey in @[ @"m_arrMessageNodeData", @"m_arrMsgData", @"m_arrMessages" ]) {
+        for (NSString *arrKey in @[ @"m_arrMessageNodeData", @"m_newArrMessageNodeData",
+                                    @"m_arrMsgData", @"m_arrMessages" ]) {
             id arr = PJQGSafeObjectForKey(vc, arrKey);
             if (!arr || PJQGIsClassObjectSafely(arr)) continue;
             if (![arr isKindOfClass:NSArray.class]) continue;
@@ -967,15 +1280,9 @@ static NSString *PJQGChatIdFromMessages(id vc, NSString **how, NSMutableString *
             if (lo < 0) lo = 0;
             for (NSInteger idx = (NSInteger)a.count - 1; idx >= lo; idx--) {
                 id msg = a[(NSUInteger)idx];
-                if (!PJQGPointerLooksSane(msg) || PJQGIsClassObjectSafely(msg)) continue;
-                for (NSString *k in @[ @"m_nsToUsr", @"m_nsFromUsr", @"m_nsRealChatUsr",
-                                       @"m_nsChatName", @"m_nsUsrName" ]) {
-                    NSString *v = PJQGSafeStringForKey(msg, k, NULL);
-                    if (!v || PJQGLooksLikeChatIdScore(v) < 15) continue;
-                    if (how) *how = [NSString stringWithFormat:@"%@[%ld].%@", arrKey, (long)idx, k];
-                    if (trace) [trace appendFormat:@"  ⑧ %@[%ld].%@ = %@  ✓\n", arrKey, (long)idx, k, v];
-                    return v;
-                }
+                NSString *tag = [NSString stringWithFormat:@"%@[%ld]", arrKey, (long)idx];
+                NSString *v = PJQGChatIdFromMessageObject(msg, how, trace, tag);
+                if (v) return v;
             }
         }
     } @catch (NSException *e) { }
@@ -1032,6 +1339,15 @@ static NSString *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace) {
                 iv ? [NSString stringWithFormat:@"\"%@\" (%@)", iv, ivHow] : @"(无)"];
     if (iv) { if (how) *how = [NSString stringWithFormat:@"成员变量 %@", ivHow]; return iv; }
 
+    // ④·5 聊天窗口自己持有的「单条消息对象」（m_lastMsgInNewArray / m_firstUnReadMsg …）
+    //      这些 ivar 的类型就是 CMessageWrap，会话里一定有消息，命中率很高。
+    {
+        NSString *how45 = nil;
+        NSString *v45 = PJQGChatIdFromSingleMsgIvars(vc, &how45, trace);
+        if (v45) { if (how) *how = how45 ?: @"单条消息对象"; return v45; }
+        if (trace) [trace appendString:@"  ④·5 单条消息对象 = (无)\n"];
+    }
+
     // ⑤ 子对象链（逻辑控制器 / 联系人 / 会话对象）
     for (NSString *h in PJQGChatIdChildKeyCandidates()) {
         id child = PJQGSafeObjectForKey(vc, h);
@@ -1065,11 +1381,18 @@ static NSString *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace) {
     }
 
     // ⑦ 微信全局服务链（会话管理器 / MMServiceCenter 中转）
-    {
+    // ★ v1.6：默认关闭。
+    // v1.5 把它放进了「点击路径」，结果点一下按钮完全没有反应 —— 这段会去调微信的
+    // 核心单例（MMSessionInfoManager / MMMsgLogicManager / MMServiceCenter getService:），
+    // 在主线程上做重型初始化，轻则卡住好几秒，重则拿到非对象返回值直接 SIGSEGV。
+    // 现在必须用户在长按菜单里显式打开「深度识别」才会走这一段。
+    if (PJQGDeepIdentify()) {
         NSString *how7 = nil;
         NSString *v7 = PJQGChatIdFromGlobalServices(&how7, trace);
         if (v7) { if (how) *how = how7 ?: @"全局服务链"; return v7; }
         if (trace) [trace appendString:@"  ⑦ 全局服务链 = (无)\n"];
+    } else if (trace) {
+        [trace appendString:@"  ⑦ 全局服务链 = (已跳过：深度识别关闭，默认不走微信核心单例)\n"];
     }
 
     // ⑧ 消息回溯（消息对象里的收发方用户名就是最原始的会话 ID）
@@ -1113,7 +1436,7 @@ static id PJQGFindProvider(SEL sel, NSString **howFound) {
     }
 
     for (NSString *cn in PJQGClassesImplementing(sel)) {
-        if (![cn hasPrefix:@"PJ"] && ![cn hasPrefix:@"Misaka"]) continue;
+        if (![cn hasPrefix:@"PJ"] && ![cn hasPrefix:@"Misaka"] && ![cn hasPrefix:@"Mikoto"]) continue;
         Class c = NSClassFromString(cn);
         if (!c) continue;
 
@@ -1125,18 +1448,34 @@ static id PJQGFindProvider(SEL sel, NSString **howFound) {
 
         // 注意：respondsToSelector: 会触发该类的 +initialize，而 +initialize 里可能抛异常
         // （MikotoHelper 的类会去碰微信的 protobuf 对象）。整个探测循环必须包 @try。
+        // ★ v1.6：改成「先查 Method 的返回类型/参数个数，再决定要不要发消息」。
+        //   顺便不再用 respondsToSelector:（它会触发 +initialize），改用 class_getInstanceMethod。
         @try {
             for (NSString *g in @[ @"sharedInstance", @"sharedManager", @"defaultManager", @"shared",
                                    @"manager", @"defaultInstance", @"instance", @"getInstance",
                                    @"sharedModel", @"sharedDataModel", @"currentManager" ]) {
                 SEL gs = NSSelectorFromString(g);
-                if (!gs || ![c respondsToSelector:gs]) continue;
-                id inst = ((id (*)(id, SEL))objc_msgSend)(c, gs);
-                if (inst && !PJQGIsClassObjectSafely(inst) && [inst respondsToSelector:sel]) {
-                    if (howFound) *howFound = [NSString stringWithFormat:@"单例 +[%@ %@]", cn, g];
-                    gPJQGProviderCache[key] = inst;
-                    return inst;
-                }
+                if (!gs) continue;
+                Method gm = class_getClassMethod(c, gs);
+                if (!gm) continue;
+                char grt[16] = {0};
+                method_getReturnType(gm, grt, sizeof(grt));
+                if (grt[0] != '@') continue;                 // 返回值不是对象 → 绝不能当 id 用
+                if (method_getNumberOfArguments(gm) != 2) continue;
+
+                id inst = ((id (*)(id, SEL))objc_msgSend)((id)c, gs);
+                if (!inst) continue;
+                if (!PJQGPointerLooksSane(inst)) continue;
+                if (PJQGIsClassObjectSafely(inst)) continue;
+                Method im = class_getInstanceMethod([inst class], sel);
+                if (!im) continue;
+                char irt[16] = {0};
+                method_getReturnType(im, irt, sizeof(irt));
+                // 目标方法可以没有返回值（addGroupData: 之类常见是 void），所以这里不做限制
+                (void)irt;
+                if (howFound) *howFound = [NSString stringWithFormat:@"单例 +[%@ %@]", cn, g];
+                gPJQGProviderCache[key] = inst;
+                return inst;
             }
         } @catch (NSException *e) {
             PJQGLog(@"[provider] +[%@ …] 探测异常: %@", cn, e.reason ?: e.name);
@@ -1175,7 +1514,9 @@ static PJQGApplyResult PJQGApply(NSString *chatId, PJQGKind kind, NSString **det
     if (PJQGSafeMode()) return PJQGApplySafeMode;
 
     NSString *selName = PJQGSelectorForKind(kind);
+    if (selName.length == 0) { if (detail) *detail = @"分组类型非法"; return PJQGApplyNoProvider; }
     SEL add = NSSelectorFromString(selName);
+    if (!add) { if (detail) *detail = @"选择子构造失败"; return PJQGApplyNoProvider; }
     PJQGLog(@"[apply] 目标选择子 = %@  会话ID = %@", selName, chatId);
 
     NSString *how = nil;
@@ -1740,11 +2081,12 @@ static NSString *PJQGDiagnose(id chatVC) {
 
 - (void)onManual {
     void (^cb)(void) = self.onManualInput;
-    [self dismissViewControllerAnimated:YES completion:^{ if (cb) cb(); }];
+    PJQGHidePanel();                       // v1.6：报告页是独立窗口的 root，不能 dismiss
+    if (cb) dispatch_async(dispatch_get_main_queue(), ^{ cb(); });
 }
 
 - (void)onClose {
-    [self dismissViewControllerAnimated:YES completion:nil];
+    PJQGHidePanel();
 }
 
 @end
@@ -1752,7 +2094,8 @@ static NSString *PJQGDiagnose(id chatVC) {
 #pragma mark - 报告与手动输入的呈现
 
 // 找出当前真正能 present 的 VC（hint 已失效则退回 keyWindow 根 VC）
-static UIViewController *PJQGTopPresentableVC(UIViewController *hint) {
+// v1.6 起主流程已改用独立窗口，这里只作为最后退路保留
+static __attribute__((unused)) UIViewController *PJQGTopPresentableVC(UIViewController *hint) {
     UIViewController *host = nil;
     @try { if (hint && hint.view.window) host = hint; } @catch (NSException *e) { }
     if (!host) {
@@ -1778,22 +2121,32 @@ static UIViewController *PJQGTopPresentableVC(UIViewController *hint) {
 }
 
 static void PJQGShowReport(UIViewController *from, NSString *text, BOOL autoCopy, void (^onManual)(void)) {
-    // 延迟 0.35s：给刚刚被 dismiss 的 ActionSheet / 弹窗留出收起时间，避免 present 冲突
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+    (void)from;   // v1.6：面板走独立窗口，不再依赖调用方传来的宿主
+    NSString *t = [(text ?: @"(报告为空)") copy];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @try {
-            UIViewController *host = PJQGTopPresentableVC(from);
-            if (!host) return;
-            if ([host isKindOfClass:[PJQGReportViewController class]]) return;
-
             PJQGReportViewController *r = [[PJQGReportViewController alloc] init];
-            r.reportText   = text ?: @"(空)";
-            r.autoCopy     = autoCopy;
+            r.reportText    = t;
+            r.autoCopy      = autoCopy;
             r.onManualInput = onManual;
-            r.modalPresentationStyle = UIModalPresentationFullScreen;
-            [host presentViewController:r animated:YES completion:nil];
+
+            // ★ v1.6：直接当「独立窗口」的 root
+            //   不再走 [宿主VC presentViewController:] —— 那么做只要宿主的层级不巧，
+            //   UIKit 会静默失败（不抛异常、没界面），表现就是「点了没反应」。
+            if (PJQGPanelWindowRef()) {
+                PJQGShowPanel(r);
+                PJQGLog(@"[report] 独立窗口展示成功，报告长度 %lu", (unsigned long)t.length);
+                return;
+            }
+            // 连窗口都建不出来：退回原生 alert，至少保证「有界面 + 能复制」
+            NSString *cut = t.length > 600 ? [t substringToIndex:600] : t;
+            PJQGAlert(@"诊断报告（折叠）",
+                      [cut stringByAppendingString:@"\n\n…点「复制全文」拿完整内容"], t);
         } @catch (NSException *e) {
-            PJQGLog(@"[report] 弹出失败: %@", e.reason);
+            PJQGLog(@"[report] 展示失败: %@", e.reason);
+            PJQGAlert(@"诊断报告（展示失败）",
+                      [NSString stringWithFormat:@"%@\n\n%@", e.reason ?: @"?", t], t);
         }
     });
 }
@@ -1802,25 +2155,27 @@ static void PJQGShowReportForHost(UIViewController *host, BOOL autoCopy, void (^
     NSString *rep = nil;
     @try { rep = PJQGDiagnose(host); }
     @catch (NSException *e) { rep = [NSString stringWithFormat:@"生成诊断报告失败: %@", e.reason]; }
+    @catch (...) { rep = @"生成诊断报告失败：非 Objective-C 异常"; }
     PJQGLog(@"[report] 生成完毕，长度 %lu", (unsigned long)rep.length);
     if (autoCopy) {
-        // 只复制「关键结论」段 —— 全文太长会被聊天输入框截断（上一版就是这么丢数据的）
+        // 只复制「关键结论」段 —— 全文太长会被聊天输入框截断（v1.4 就是这么丢数据的）
         @try { UIPasteboard.generalPasteboard.string = PJQGHeadOnly(rep ?: @""); } @catch (NSException *e) { }
+    }
+    if (rep.length == 0) {
+        PJQGAlert(@"诊断报告为空", @"报告一个字都没生成出来，请把日志文件发我。", nil);
+        return;
     }
     PJQGShowReport(host, rep, autoCopy, onManual);
 }
 
 // 手动输入会话 ID
 static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSString *chatId)) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
+    (void)from;   // v1.6：走面板窗口
+    dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            UIViewController *host = PJQGTopPresentableVC(from);
-            if (!host) return;
-
             UIAlertController *al = [UIAlertController
                 alertControllerWithTitle:@"手动输入会话 ID"
-                message:@"例如 wxid_xxx / xxxxx@chatroom / gh_xxx\n（可从诊断报告的「关键成员取值」里复制）"
+                message:@"例如 wxid_xxx / xxxxx@chatroom / gh_xxx\n（可从诊断报告的「关键取值」里复制）"
                 preferredStyle:UIAlertControllerStyleAlert];
 
             __block UITextField *tfRef = nil;
@@ -1840,7 +2195,8 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
             }]];
             [al addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
                                 handler:^(UIAlertAction *a) { if (done) done(nil); }]];
-            [host presentViewController:al animated:YES completion:nil];
+            // ★ v1.6：走面板窗口，不再依赖调用方传来的 VC
+            PJQGPresentOnPanel(al);
         } @catch (NSException *e) {
             PJQGLog(@"[manual] 弹出失败: %@", e.reason);
         }
@@ -1864,6 +2220,7 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
 - (void)installNavButton:(UIViewController *)vc;
 - (void)installBubble:(UIViewController *)vc;
 - (void)onTap:(UIButton *)sender;
+- (void)performGroupTap;
 - (void)onDiagTap:(UIButton *)sender;
 - (void)onLongPress:(UILongPressGestureRecognizer *)g;
 - (void)onPan:(UIPanGestureRecognizer *)g;
@@ -1873,6 +2230,7 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
 - (void)manualInput;
 - (UIViewController *)topmost;
 - (void)presentMenu;
+- (void)runSelfTest;
 - (void)presentPickerSetDefault:(BOOL)setDefault;
 - (void)presentKindChooserForManualId:(NSString *)chatId;
 - (void)anchorPopover:(UIAlertController *)sheet;
@@ -2026,22 +2384,55 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
 #pragma mark 交互
 
 - (void)onTap:(UIButton *)sender {
-    @try {
-        PJQGLog(@"[tap] 单击，默认分组=%ld", (long)PJQGDefaultKind());
-        NSInteger d = PJQGDefaultKind();
-        if (d < 0) { [self presentPickerSetDefault:YES]; return; }
+    // ★ v1.6 核心改动：先把「按钮活着」这件事画到屏幕上，再去干重活。
+    //   只要这行字出现，就证明按钮和 Hook 都是好的；之后无论走进哪个分支，
+    //   屏幕上一定会继续出现结果或报错 —— 再也不会出现「点了完全没反应」。
+    //   （0.12s 延迟是为了确保这一帧真的画出来了，再开始可能耗时的识别。）
+    PJQGHUD(@"分组 ✓ 已响应 · 正在识别会话…", YES);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try {
+            [self performGroupTap];
+        } @catch (NSException *e) {
+            PJQGLog(@"[tap] 异常: %@", e.reason);
+            PJQGHUD(@"分组出错，见弹窗", NO);
+            PJQGAlert(@"分组出现异常",
+                      [NSString stringWithFormat:@"%@\n\n崩溃/日志文件：%@",
+                       e.reason ?: e.name ?: @"未知", PJQGLogPath()],
+                      nil);
+        } @catch (...) {
+            PJQGHUD(@"分组出错（非 Objective-C 异常）", NO);
+        }
+    });
+}
 
-        UIViewController *vc = self.host;
-        if (!vc) return;
-        NSString *how = nil;
-        NSString *chatId = PJQGChatId(vc, &how);
-        PJQGLog(@"[tap] 会话ID=%@ (来源 %@)", chatId ?: @"(空)", how ?: @"-");
-        if (chatId.length == 0) { [self reportForMissingChatId]; return; }
-
-        [self applyChatId:chatId kind:(PJQGKind)d setDefault:NO];
-    } @catch (NSException *e) {
-        PJQGLog(@"[tap] 异常: %@", e.reason);
+// v1.6：把原来的同步逻辑挪到这里，每一步都在屏幕上留痕
+- (void)performGroupTap {
+    UIViewController *vc = self.host;
+    if (!vc) {
+        PJQGHUD(@"拿不到聊天窗口对象（host 为空）", NO);
+        return;
     }
+
+    NSString *how = nil;
+    NSString *chatId = PJQGChatId(vc, &how);
+    PJQGLog(@"[tap] 会话ID=%@ (来源 %@)", chatId ?: @"(空)", how ?: @"-");
+
+    if (chatId.length == 0) {
+        PJQGHUD(@"未识别到会话 → 打开诊断报告", NO);
+        [self reportForMissingChatId];
+        return;
+    }
+
+    NSInteger d = PJQGDefaultKind();
+    if (d < 0) {
+        PJQGHUD([NSString stringWithFormat:@"已识别：%@ · 请选分组", chatId], NO);
+        [self presentPickerSetDefault:YES];
+        return;
+    }
+
+    PJQGHUD([NSString stringWithFormat:@"%@ → 归入「%@」", chatId, PJQGKindName((PJQGKind)d)], NO);
+    [self applyChatId:chatId kind:(PJQGKind)d setDefault:NO];
 }
 
 - (void)onDiagTap:(UIButton *)sender {
@@ -2072,17 +2463,22 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
 
 - (void)applyChatId:(NSString *)chatId kind:(PJQGKind)kind setDefault:(BOOL)setDefault {
     UIViewController *host = self.host;
-    if (!host) return;
+    if (!host) { PJQGHUD(@"聊天窗口已关闭，放弃", NO); return; }
     if (setDefault) { PJQGSetDefaultKind(kind); [self refreshTitle]; }
 
+    PJQGHUD(@"正在写入分组…", YES);
     NSString *detail = nil;
     PJQGApplyResult r = PJQGApply(chatId, kind, &detail);
     if (r == PJQGApplyOK) {
-        PJQGToast(host.view, [NSString stringWithFormat:@"已归入：%@%@",
-                              PJQGKindName(kind), setDefault ? @"（已设为默认）" : @""]);
+        NSString *ok = [NSString stringWithFormat:@"✅ 已归入：%@%@",
+                        PJQGKindName(kind), setDefault ? @"（并设为默认）" : @""];
+        PJQGHUD(ok, NO);
+        PJQGToast(host.view, ok);
         return;
     }
-    PJQGToast(host.view, PJQGApplyResultText(r, detail));
+    NSString *fail = PJQGApplyResultText(r, detail);
+    PJQGHUD([NSString stringWithFormat:@"❌ %@", fail], NO);
+    PJQGToast(host.view, fail);
     // 失败：半秒后自动弹报告，方便直接复制发回
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ [self showReportAutoCopy:YES]; });
@@ -2090,6 +2486,7 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
 
 - (void)reportForMissingChatId {
     UIViewController *host = self.host;
+    PJQGHUD(@"未能识别当前会话 → 生成诊断报告", NO);
     if (host.view) PJQGToast(host.view, @"未能识别当前会话，已生成诊断报告（可手填会话ID）");
     __weak PJQGChatAction *ws = self;
     PJQGShowReportForHost(host, YES, ^{
@@ -2108,17 +2505,16 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
 
 - (void)manualInput {
     __weak PJQGChatAction *ws = self;
-    UIViewController *from = [self topmost] ?: self.host;
-    PJQGRequestManualChatId(from, ^(NSString *chatId) {
-        PJQGChatAction *ss = ws;
-        if (!ss || chatId.length == 0) return;
-        UIViewController *t = [ss topmost];
-        if ([t isKindOfClass:[PJQGReportViewController class]]) {
-            [t dismissViewControllerAnimated:YES completion:nil];
-        }
-        NSInteger d = PJQGDefaultKind();
-        if (d < 0) { [ss presentKindChooserForManualId:chatId]; return; }
-        [ss applyChatId:chatId kind:(PJQGKind)d setDefault:NO];
+    PJQGHidePanel();                      // v1.6：报告页现在是独立窗口，直接收掉
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        PJQGRequestManualChatId(nil, ^(NSString *chatId) {
+            PJQGChatAction *ss = ws;
+            if (!ss || chatId.length == 0) return;
+            NSInteger d = PJQGDefaultKind();
+            if (d < 0) { [ss presentKindChooserForManualId:chatId]; return; }
+            [ss applyChatId:chatId kind:(PJQGKind)d setDefault:NO];
+        });
     });
 }
 
@@ -2132,9 +2528,6 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
 }
 
 - (void)presentMenu {
-    UIViewController *vc = [self topmost];
-    if (!vc || vc.isBeingDismissed) return;
-
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"快速分组"
                                 message:nil
                                 preferredStyle:UIAlertControllerStyleActionSheet];
@@ -2142,6 +2535,10 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
     [sheet addAction:[UIAlertAction actionWithTitle:@"查看诊断报告（可复制）"
                         style:UIAlertActionStyleDefault
                         handler:^(UIAlertAction *a) { [self showReportAutoCopy:YES]; }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"自检（会话识别全过程·可复制）"
+                        style:UIAlertActionStyleDefault
+                        handler:^(UIAlertAction *a) { [self runSelfTest]; }]];
 
     [sheet addAction:[UIAlertAction actionWithTitle:@"手动输入会话 ID…"
                         style:UIAlertActionStyleDefault
@@ -2183,6 +2580,16 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
         PJQGToast(self.host.view, PJQGDeepDiag() ? @"深度诊断已开启" : @"深度诊断已关闭");
     }]];
 
+    // v1.6：默认关闭。开启后识别才会去碰微信的全局单例（会话管理器 / MMServiceCenter），
+    //       危险性较高（可能卡住主线程），所以只作为「其他方法都识别不到」时的最后手段。
+    [sheet addAction:[UIAlertAction actionWithTitle:
+        (PJQGDeepIdentify() ? @"关闭深度识别（不碰微信全局单例）" : @"开启深度识别（最后手段）")
+        style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *a) {
+        PJQGSetDeepIdentify(!PJQGDeepIdentify());
+        PJQGToast(self.host.view, PJQGDeepIdentify() ? @"深度识别已开启" : @"深度识别已关闭");
+    }]];
+
     [sheet addAction:[UIAlertAction actionWithTitle:
                         (PJQGBubbleVisible() ? @"隐藏悬浮球" : @"显示悬浮球")
                         style:UIAlertActionStyleDefault
@@ -2196,13 +2603,69 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
                         style:UIAlertActionStyleCancel handler:nil]];
 
     [self anchorPopover:sheet];
-    [vc presentViewController:sheet animated:YES completion:nil];
+    // ★ v1.6：走面板窗口弹菜单 —— 原来 [vc presentViewController:] 在 vc 不合适时
+    //   会静默失败（长按菜单也就「没反应」了）。
+    PJQGPresentOnPanel(sheet);
+}
+
+// v1.6 新增：自检 —— 把「这个版本到底跑成什么样」一次性打出来并复制到剪贴板。
+// 长按「分组」→ 自检，然后把弹出来的内容整段发回即可。
+- (void)runSelfTest {
+    PJQGHUD(@"自检中…", YES);
+    UIViewController *vc = self.host;
+    NSMutableString *s = [NSMutableString string];
+    @try {
+        [s appendFormat:@"===== MikotoQuickGroup v%@ 自检 =====\n", kPJQGVersion];
+        [s appendFormat:@"时间      : %@\n", [NSDate date]];
+        [s appendFormat:@"Bundle    : %@\n", NSBundle.mainBundle.bundleIdentifier ?: @"?"];
+        [s appendFormat:@"微信版本  : %@ (%@)\n",
+            [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?",
+            [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?"];
+        [s appendFormat:@"开关      : 安全模式=%@ 深度诊断=%@ 深度识别=%@ 悬浮球=%@\n",
+            PJQGSafeMode() ? @"开" : @"关", PJQGDeepDiag() ? @"开" : @"关",
+            PJQGDeepIdentify() ? @"开" : @"关", PJQGBubbleVisible() ? @"显示" : @"隐藏"];
+        [s appendFormat:@"默认分组  : %@\n",
+            PJQGDefaultKind() < 0 ? @"(未设置)" : PJQGKindName((PJQGKind)PJQGDefaultKind())];
+        [s appendFormat:@"日志文件  : %@\n", PJQGLogPath()];
+
+        [s appendString:@"\n--- 环境 ---\n"];
+        [s appendFormat:@"聊天窗口类: %@\n", vc ? NSStringFromClass([vc class]) : @"(host 为空)"];
+        [s appendFormat:@"窗口已上屏: %@\n", (vc && vc.view.window) ? @"是" : @"否"];
+        [s appendFormat:@"Mikoto类  : PJGroupDataModel=%@ PJMisakaManager=%@ PJGroupManager=%@ PJManagerModel=%@\n",
+            NSClassFromString(@"PJGroupDataModel") ? @"✓" : @"✗",
+            NSClassFromString(@"PJMisakaManager") ? @"✓" : @"✗",
+            NSClassFromString(@"PJGroupManager") ? @"✓" : @"✗",
+            NSClassFromString(@"PJManagerModel") ? @"✓" : @"✗"];
+    } @catch (NSException *e) { [s appendFormat:@"(环境段异常: %@)\n", e.reason]; }
+
+    @try {
+        [s appendString:@"\n--- 写入接口 ---\n"];
+        for (NSString *sn in @[ @"addGroupData:", @"addChatData:", @"addOtherGroupData:" ]) {
+            NSString *how = nil;
+            id p = PJQGFindProvider(NSSelectorFromString(sn), &how);
+            [s appendFormat:@"%@ → %@ (%@)\n", sn,
+                p ? NSStringFromClass([p class]) : @"(未找到)", how ?: @"-"];
+        }
+    } @catch (NSException *e) { [s appendFormat:@"(接口段异常: %@)\n", e.reason]; }
+
+    @try {
+        [s appendString:@"\n--- 会话识别全过程 ---\n"];
+        NSMutableString *tr = [NSMutableString string];
+        NSString *how = nil;
+        NSString *cid = PJQGChatIdEx(vc, &how, tr);
+        [s appendFormat:@"结果: %@   (来源 %@)\n", cid ?: @"(未取到)", how ?: @"-"];
+        [s appendString:tr];
+    } @catch (NSException *e) { [s appendFormat:@"(识阶段异常: %@)\n", e.reason]; }
+
+    [s appendString:@"===== 以上整段复制发回即可 =====\n"];
+
+    PJQGLog(@"[自检]\n%@", s);
+    @try { UIPasteboard.generalPasteboard.string = s; } @catch (NSException *e) { }
+    PJQGHUD(@"自检完成 ✓ 已复制到剪贴板", NO);
+    PJQGShowReport(vc, s, NO, nil);
 }
 
 - (void)presentPickerSetDefault:(BOOL)setDefault {
-    UIViewController *vc = [self topmost];
-    if (!vc || vc.isBeingDismissed) return;
-
     NSString *title = setDefault ? @"选择默认分组" : @"本次归入";
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:title
                                 message:setDefault ? @"选择后成为默认分组，之后单击即直接归入" : nil
@@ -2215,7 +2678,7 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
                             handler:^(UIAlertAction *a) {
             @try {
                 UIViewController *host = self.host;
-                if (!host) return;
+                if (!host) { PJQGHUD(@"聊天窗口已关闭", NO); return; }
                 NSString *how = nil;
                 NSString *chatId = PJQGChatId(host, &how);
                 PJQGLog(@"[picker] 会话ID=%@ (来源 %@)", chatId ?: @"(空)", how ?: @"-");
@@ -2230,13 +2693,10 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消"
                         style:UIAlertActionStyleCancel handler:nil]];
     [self anchorPopover:sheet];
-    [vc presentViewController:sheet animated:YES completion:nil];
+    PJQGPresentOnPanel(sheet);
 }
 
 - (void)presentKindChooserForManualId:(NSString *)chatId {
-    UIViewController *vc = [self topmost];
-    if (!vc || vc.isBeingDismissed) { [self applyChatId:chatId kind:PJQGKindGroup setDefault:NO]; return; }
-
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"归入哪个分组？"
                                 message:chatId preferredStyle:UIAlertControllerStyleActionSheet];
     for (NSInteger k = PJQGKindGroup; k <= PJQGKindOther; k++) {
@@ -2495,8 +2955,11 @@ static void PJQGShowLaunchAlert(void) {
                 "进入任意聊天窗口：右侧有可拖动的「分组」按钮，旁边蓝色「诊」按钮直接打开诊断报告；"
                 "右上角也有「分组」。\n\n"
                 "单击「分组」= 归入默认分组；长按 = 菜单。\n\n"
-                "若提示「未能识别当前会话」，会**自动弹出诊断报告**并复制到剪贴板，"
-                "直接粘贴发给我即可。\n\n日志：%@", PJQGLogPath()];
+                "★ v1.6：点一下「分组」，屏幕上会立刻出现一条提示（「已响应 · 正在识别会话」），"
+                "之后每一步都会继续显示结果。所以现在不会再出现「点了完全没反应」——"
+                "如果连那条提示都没出现，说明插件没被加载进来。\n\n"
+                "如果提示「未识别到会话」，会自动弹出报告并复制到剪贴板，直接发我即可；"
+                "也可以长按「分组」→「自检」，把自检结果整段发我。\n\n日志：%@", PJQGLogPath()];
     }
 
     UIWindow *kw = nil;

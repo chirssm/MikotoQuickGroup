@@ -1,8 +1,8 @@
 Package: com.pj.mikotoquickgroup
 Name: MikotoQuickGroup
-Version: 1.6.0
+Version: 1.7.0
 Architecture: iphoneos-arm64
-Description: 独立插件 —— 在微信聊天界面提供「快速分组」按钮，一键把当前会话归入 MikotoHelper 的指定分组（默认分组记忆）；内置诊断报告与会话 ID 识别。v1.6：点击后立刻有可见反馈（不再「点了没反应」）、面板改用独立 UIWindow、危险的全局单例探测默认关闭（可长按菜单开启）、新增「自检」。
+Description: 独立插件 —— 在微信聊天界面提供「快速分组」按钮，一键把当前会话归入 MikotoHelper 的指定分组（默认分组记忆）；内置诊断报告与会话 ID 识别。v1.7：异常定位升级（弹窗直接显示「死在哪个阶段」+ 调用栈 + 最近日志，并自动复制）；识别链 / provider 查找 / 写入流程全部再加一层兜底；新增「通用 setter 捕获」解决动态捕获一直为空的问题。
 Maintainer: local
 Author: local
 Section: Tweaks

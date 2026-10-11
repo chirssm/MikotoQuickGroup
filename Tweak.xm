@@ -46,7 +46,7 @@
 
 #pragma mark - 常量
 
-static NSString *const kPJQGVersion          = @"1.6";
+static NSString *const kPJQGVersion          = @"1.7";
 static NSString *const kPJQGDefaultKindKey   = @"pjqg_default_kind";   // NSInteger, -1 = 未设置
 static NSString *const kPJQGBubbleVisibleKey = @"pjqg_bubble_visible";
 static NSString *const kPJQGSilentKey        = @"pjqg_silent_alert";
@@ -94,6 +94,12 @@ static NSArray    *PJQGIvarPatterns(void);
 static BOOL        PJQGNameMatchesPatterns(NSString *low, NSArray *pats);
 static NSString   *PJQGDiagnoseHead(id chatVC);
 static NSArray    *PJQGIvarCandidateNames(id obj, NSUInteger max);
+// v1.7：异常定位三件套 —— 阶段名 / 异常摘要（含调用栈）/ 内存日志尾部
+static int          PJQGLooksLikeChatIdScore(NSString *s);
+static NSString   *PJQGDumpException(NSException *e);
+static NSString   *PJQGTailOfLog(NSUInteger maxLines);
+static void         PJQGHookSettersGeneric(Class cls);
+static void         PJQGCaptureStage(NSString *stage);
 
 typedef NS_ENUM(NSInteger, PJQGKind) {
     PJQGKindGroup = 0,   // 群聊
@@ -124,6 +130,14 @@ static NSString *PJQGSelectorForKind(PJQGKind k) {
 static NSMutableString *gPJQGReport  = nil;
 static NSString        *gPJQGLogPath = nil;
 static NSString        *gPJQGLasMatchReason = nil;
+
+// ★ v1.7：阶段追踪。
+//   教训：v1.4~v1.6 每次报错都只能拿到一句「Property Name should be baseRequest」，
+//   根本不知道死在识别链、provider 查找、还是真正调用上。现在每一步都记阶段名，
+//   异常逃出来时弹窗里会直接写「阶段：xxx」—— 一轮就能定位。
+static NSString        *gPJQGStage = @"(未开始)";
+static void PJQGCaptureStage(NSString *stage) { if (stage) gPJQGStage = stage; }
+#define PJQGSTAGE(x) PJQGCaptureStage(x)
 
 // 沙盒环境下 /var/mobile/Documents 不可写（这正是之前你找不到日志的原因）。
 // 依次尝试：App 沙盒 Documents → App tmp → /var/mobile/Documents → /tmp
@@ -217,6 +231,54 @@ static void PJQGLog(NSString *fmt, ...) {
     va_end(ap);
     if (!s) return;
     @try { PJQGLogWrite(s); } @catch (NSException *e) { }
+}
+
+#pragma mark - v1.7 异常摘要（阶段 + 调用栈 + 日志尾部）
+
+// 内存日志的末尾若干行 —— 异常弹窗里直接显示，省得去翻文件（也方便一次粘贴发回）
+static NSString *PJQGTailOfLog(NSUInteger maxLines) {
+    @try {
+        NSString *all = gPJQGReport;
+        if (all.length == 0) return @"(无日志)";
+        NSArray *lines = [all componentsSeparatedByString:@"\n"];
+        NSUInteger n = lines.count;
+        NSUInteger start = (n > maxLines) ? (n - maxLines) : 0;
+        NSMutableArray *keep = [NSMutableArray array];
+        for (NSUInteger i = start; i < n; i++) {
+            NSString *l = lines[i];
+            if (l.length) [keep addObject:l];
+        }
+        return keep.count ? [keep componentsJoinedByString:@"\n"] : @"(无日志)";
+    } @catch (NSException *e) { return @"(取日志失败)"; }
+}
+
+// 异常摘要：阶段名 + 异常名 + 原因 + 异常自己的调用栈 + 当前线程调用栈 + 最近日志
+// 「调用栈」里会直接出现 微信/MikotoHelper 的方法名 —— 一眼就能看出是谁抛的。
+static NSString *PJQGDumpException(NSException *e) {
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"==== MikotoQuickGroup 异常摘要 v%@ ====\n", kPJQGVersion];
+    [s appendFormat:@"阶段    : %@\n", gPJQGStage ?: @"?"];
+    [s appendFormat:@"异常名  : %@\n", e.name ?: @"?"];
+    [s appendFormat:@"异常原因: %@\n", e.reason ?: @"?"];
+    @try {
+        NSArray *fr = e.callStackSymbols;
+        if (fr.count) {
+            [s appendString:@"--- 异常调用栈 ---\n"];
+            NSUInteger lim = fr.count > 30 ? 30 : fr.count;
+            for (NSUInteger i = 0; i < lim; i++) [s appendFormat:@"  %@\n", fr[i]];
+        }
+    } @catch (NSException *x) { }
+    @try {
+        NSArray *fr = NSThread.callStackSymbols;
+        if (fr.count) {
+            [s appendString:@"--- 当前线程调用栈 ---\n"];
+            NSUInteger lim = fr.count > 30 ? 30 : fr.count;
+            for (NSUInteger i = 0; i < lim; i++) [s appendFormat:@"  %@\n", fr[i]];
+        }
+    } @catch (NSException *x) { }
+    [s appendString:@"--- 最近日志 ---\n"];
+    [s appendString:PJQGTailOfLog(30)];
+    return s;
 }
 
 #pragma mark - 崩溃取证
@@ -1289,13 +1351,14 @@ static NSString *PJQGChatIdFromMessages(id vc, NSString **how, NSMutableString *
     return nil;
 }
 
-static NSString *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace) {
+static NSString *PJQGChatIdInner(id vc, NSString **how, NSMutableString *trace) {
     if (how) *how = nil;
     if (!vc) return nil;
     NSArray *kvcKeys = PJQGChatIdKeyCandidates();
     NSArray *selNames = PJQGChatIdSelCandidates();
 
     // ① 动态捕获
+    PJQGSTAGE(@"识别①动态捕获");
     @try {
         id cap = objc_getAssociatedObject(vc, kPJQGCapturedIdKey);
         if ([cap isKindOfClass:NSString.class] && [(NSString *)cap length] > 0) {
@@ -1308,6 +1371,7 @@ static NSString *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace) {
     if (trace) [trace appendString:@"  ① 动态捕获 = (无)\n"];
 
     // ② KVC
+    PJQGSTAGE(@"识别②KVC");
     for (NSString *k in kvcKeys) {
         NSString *v = PJQGSafeStringForKey(vc, k, NULL);
         if (trace) [trace appendFormat:@"  ② KVC %@ = %@\n", k, v ?: @"(无)"];
@@ -1315,6 +1379,7 @@ static NSString *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace) {
     }
 
     // ③ 选择子探测
+    PJQGSTAGE(@"识别③选择子探测");
     for (NSString *sn in selNames) {
         SEL s = NSSelectorFromString(sn);
         @try {
@@ -1333,6 +1398,7 @@ static NSString *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace) {
     if (trace) [trace appendString:@"  ③ 选择子探测 = (无)\n"];
 
     // ④ 成员变量扫描
+    PJQGSTAGE(@"识别④成员变量扫描");
     NSString *ivHow = nil;
     NSString *iv = PJQGChatIdFromIvars(vc, &ivHow);
     if (trace) [trace appendFormat:@"  ④ 成员变量扫描 = %@\n",
@@ -1340,6 +1406,7 @@ static NSString *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace) {
     if (iv) { if (how) *how = [NSString stringWithFormat:@"成员变量 %@", ivHow]; return iv; }
 
     // ④·5 聊天窗口自己持有的「单条消息对象」（m_lastMsgInNewArray / m_firstUnReadMsg …）
+    PJQGSTAGE(@"识别④·5单条消息对象");
     //      这些 ivar 的类型就是 CMessageWrap，会话里一定有消息，命中率很高。
     {
         NSString *how45 = nil;
@@ -1349,6 +1416,7 @@ static NSString *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace) {
     }
 
     // ⑤ 子对象链（逻辑控制器 / 联系人 / 会话对象）
+    PJQGSTAGE(@"识别⑤子对象链");
     for (NSString *h in PJQGChatIdChildKeyCandidates()) {
         id child = PJQGSafeObjectForKey(vc, h);
         if (!child || PJQGIsClassObjectSafely(child)) continue;
@@ -1387,6 +1455,7 @@ static NSString *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace) {
     // 在主线程上做重型初始化，轻则卡住好几秒，重则拿到非对象返回值直接 SIGSEGV。
     // 现在必须用户在长按菜单里显式打开「深度识别」才会走这一段。
     if (PJQGDeepIdentify()) {
+        PJQGSTAGE(@"识别⑦全局服务链");
         NSString *how7 = nil;
         NSString *v7 = PJQGChatIdFromGlobalServices(&how7, trace);
         if (v7) { if (how) *how = how7 ?: @"全局服务链"; return v7; }
@@ -1396,6 +1465,7 @@ static NSString *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace) {
     }
 
     // ⑧ 消息回溯（消息对象里的收发方用户名就是最原始的会话 ID）
+    PJQGSTAGE(@"识别⑧消息回溯");
     {
         NSString *how8 = nil;
         NSString *v8 = PJQGChatIdFromMessages(vc, &how8, trace);
@@ -1414,6 +1484,23 @@ static NSString *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace) {
     return nil;
 }
 
+// ★ v1.7：识别链整体再包一层。
+//   即使将来某个微信版本里又出现「没被 @try 覆盖到」的调用，也只会「识别失败/退回报告」，
+//   不会再把异常抛给上层变成「分组出现异常」弹窗。trace 里会写清死在哪个阶段。
+static NSString *PJQGChatIdEx(id vc, NSString **how, NSMutableString *trace) {
+    @try {
+        return PJQGChatIdInner(vc, how, trace);
+    } @catch (NSException *e) {
+        PJQGLog(@"[识别] 异常 @阶段[%@]: %@", gPJQGStage, e.reason);
+        if (trace) [trace appendFormat:@"  ⚠︎ 识别链异常 @%@ : %@\n", gPJQGStage, e.reason];
+        if (how) *how = [NSString stringWithFormat:@"异常(%@)", gPJQGStage];
+        return nil;
+    } @catch (...) {
+        if (trace) [trace appendString:@"  ⚠︎ 识别链非 ObjC 异常\n"];
+        return nil;
+    }
+}
+
 static NSString *PJQGChatId(id vc, NSString **how) {
     return PJQGChatIdEx(vc, how, nil);
 }
@@ -1422,7 +1509,7 @@ static NSString *PJQGChatId(id vc, NSString **how) {
 
 static NSMutableDictionary *gPJQGProviderCache = nil;
 
-static id PJQGFindProvider(SEL sel, NSString **howFound) {
+static id PJQGFindProviderInner(SEL sel, NSString **howFound) {
     if (howFound) *howFound = nil;
     if (!sel) return nil;
     if (!gPJQGProviderCache) gPJQGProviderCache = [NSMutableDictionary dictionary];
@@ -1487,6 +1574,23 @@ static id PJQGFindProvider(SEL sel, NSString **howFound) {
     return nil;
 }
 
+// ★ v1.7：provider 查找整段兜底。
+//   provider 探测要往「实现了 addGroupData: 的类的单例访问器」发消息，那会触发对方 +initialize，
+//   而 +initialize 里可能直接抛异常（v1.4 报告里的 baseResponse、v1.6 的 baseRequest 都属于这一类）。
+//   内部本来就有 @try，这里再包一层，确保它永远不会把异常抛给调用者。
+static id PJQGFindProvider(SEL sel, NSString **howFound) {
+    @try {
+        return PJQGFindProviderInner(sel, howFound);
+    } @catch (NSException *e) {
+        PJQGLog(@"[provider] 异常 @阶段[%@]: %@", gPJQGStage, e.reason);
+        if (howFound) *howFound = [NSString stringWithFormat:@"异常(%@)", e.reason ?: @"?"];
+        return nil;
+    } @catch (...) {
+        if (howFound) *howFound = @"非 ObjC 异常";
+        return nil;
+    }
+}
+
 #pragma mark - 实际写入
 
 typedef NS_ENUM(NSInteger, PJQGApplyResult) {
@@ -1508,7 +1612,7 @@ static NSString *PJQGApplyResultText(PJQGApplyResult r, NSString *detail) {
     return @"失败";
 }
 
-static PJQGApplyResult PJQGApply(NSString *chatId, PJQGKind kind, NSString **detail) {
+static PJQGApplyResult PJQGApplyInner(NSString *chatId, PJQGKind kind, NSString **detail) {
     if (detail) *detail = nil;
     if (chatId.length == 0) { if (detail) *detail = @"会话 ID 为空"; return PJQGApplyNoProvider; }
     if (PJQGSafeMode()) return PJQGApplySafeMode;
@@ -1519,6 +1623,7 @@ static PJQGApplyResult PJQGApply(NSString *chatId, PJQGKind kind, NSString **det
     if (!add) { if (detail) *detail = @"选择子构造失败"; return PJQGApplyNoProvider; }
     PJQGLog(@"[apply] 目标选择子 = %@  会话ID = %@", selName, chatId);
 
+    PJQGSTAGE(@"apply:查找写入接口");
     NSString *how = nil;
     id provider = PJQGFindProvider(add, &how);
     PJQGLog(@"[apply] provider = %@  via %@",
@@ -1537,6 +1642,7 @@ static PJQGApplyResult PJQGApply(NSString *chatId, PJQGKind kind, NSString **det
     PJQGLog(@"[apply] 验签通过: %@", why ?: @"ok");
 
     BOOL ok = NO;
+    PJQGSTAGE(@"apply:调用写入接口");
     PJQGRiskyBegin("addData");
     @try {
         ((void (*)(id, SEL, id))objc_msgSend)(provider, add, arg);
@@ -1549,6 +1655,7 @@ static PJQGApplyResult PJQGApply(NSString *chatId, PJQGKind kind, NSString **det
 
     if (!ok) return PJQGApplyException;
 
+    PJQGSTAGE(@"apply:刷新会话列表");
     SEL rebuild = NSSelectorFromString(@"rebuildMainSessions");
     NSString *how2 = nil;
     id rb = PJQGFindProvider(rebuild, &how2);
@@ -1568,6 +1675,21 @@ static PJQGApplyResult PJQGApply(NSString *chatId, PJQGKind kind, NSString **det
         PJQGLog(@"[apply] 未找到 rebuildMainSessions");
     }
     return PJQGApplyOK;
+}
+
+// ★ v1.7：整个写入流程最外层兜底 —— 任何异常转成「调用报错：xxx（阶段 yyy）」，
+//   走正常的失败提示 + 报告，而不是弹「分组出现异常」。
+static PJQGApplyResult PJQGApply(NSString *chatId, PJQGKind kind, NSString **detail) {
+    @try {
+        return PJQGApplyInner(chatId, kind, detail);
+    } @catch (NSException *e) {
+        PJQGLog(@"[apply] ✗ 异常逃出 @阶段[%@]: %@", gPJQGStage, e.reason);
+        if (detail) *detail = [NSString stringWithFormat:@"%@（阶段 %@）", e.reason ?: e.name ?: @"?", gPJQGStage];
+        return PJQGApplyException;
+    } @catch (...) {
+        if (detail) *detail = [NSString stringWithFormat:@"非 ObjC 异常（阶段 %@）", gPJQGStage];
+        return PJQGApplyException;
+    }
 }
 
 #pragma mark - 诊断报告
@@ -2391,15 +2513,21 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
     PJQGHUD(@"分组 ✓ 已响应 · 正在识别会话…", YES);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        PJQGSTAGE(@"onTap");
         @try {
             [self performGroupTap];
         } @catch (NSException *e) {
-            PJQGLog(@"[tap] 异常: %@", e.reason);
-            PJQGHUD(@"分组出错，见弹窗", NO);
-            PJQGAlert(@"分组出现异常",
-                      [NSString stringWithFormat:@"%@\n\n崩溃/日志文件：%@",
-                       e.reason ?: e.name ?: @"未知", PJQGLogPath()],
-                      nil);
+            // ★ v1.7：异常逃到这一层，说明有一个我没堵住的洞。
+            //   这一版把「阶段 + 调用栈 + 最近日志」一次性打出来并复制到剪贴板，
+            //   弹窗里直接写阶段名 —— 下一轮就能精准定位，不用再猜。
+            NSString *dig = PJQGDumpException(e);
+            PJQGLog(@"[tap] ✗ 异常逃出 @阶段[%@]: %@", gPJQGStage, e.reason);
+            PJQGHUD([NSString stringWithFormat:@"分组出错（阶段：%@）", gPJQGStage], NO);
+            @try { UIPasteboard.generalPasteboard.string = dig; } @catch (NSException *x) { }
+            NSString *brief = [NSString stringWithFormat:
+                @"阶段   : %@\n原因   : %@\n\n完整诊断（含调用栈+日志）已复制到剪贴板，直接粘贴发我。",
+                gPJQGStage ?: @"?", e.reason ?: e.name ?: @"未知"];
+            PJQGAlert(@"分组出现异常", brief, dig);
         } @catch (...) {
             PJQGHUD(@"分组出错（非 Objective-C 异常）", NO);
         }
@@ -2407,6 +2535,8 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
 }
 
 // v1.6：把原来的同步逻辑挪到这里，每一步都在屏幕上留痕
+// v1.7：每一步再各自包一层 @try —— 任何一个环节出问题都只会「这一步失败」，
+//       不会再像以前那样整条链路崩掉，而且日志/弹窗里能看出是哪一步。
 - (void)performGroupTap {
     UIViewController *vc = self.host;
     if (!vc) {
@@ -2414,25 +2544,54 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
         return;
     }
 
+    PJQGSTAGE(@"识别会话ID");
     NSString *how = nil;
-    NSString *chatId = PJQGChatId(vc, &how);
-    PJQGLog(@"[tap] 会话ID=%@ (来源 %@)", chatId ?: @"(空)", how ?: @"-");
+    NSString *chatId = nil;
+    @try { chatId = PJQGChatId(vc, &how); }
+    @catch (NSException *e) { PJQGLog(@"[tap] 识别阶段异常: %@", e.reason); }
+    PJQGLog(@"[tap] 会话ID=%@ (来源 %@) 结束阶段=%@", chatId ?: @"(空)", how ?: @"-", gPJQGStage);
 
     if (chatId.length == 0) {
+        PJQGSTAGE(@"生成诊断报告");
         PJQGHUD(@"未识别到会话 → 打开诊断报告", NO);
-        [self reportForMissingChatId];
+        @try { [self reportForMissingChatId]; }
+        @catch (NSException *e) {
+            NSString *dig = PJQGDumpException(e);
+            PJQGHUD([NSString stringWithFormat:@"报告生成异常（阶段：%@）", gPJQGStage], NO);
+            @try { UIPasteboard.generalPasteboard.string = dig; } @catch (NSException *x) { }
+            PJQGAlert(@"分组出现异常", [NSString stringWithFormat:@"阶段：%@\n原因：%@\n\n已复制到剪贴板。",
+                                      gPJQGStage, e.reason ?: e.name ?: @"未知"], dig);
+        }
         return;
     }
 
-    NSInteger d = PJQGDefaultKind();
+    PJQGSTAGE(@"读取默认分组");
+    NSInteger d = -1;
+    @try { d = PJQGDefaultKind(); } @catch (NSException *e) { }
+
     if (d < 0) {
+        PJQGSTAGE(@"选择默认分组");
         PJQGHUD([NSString stringWithFormat:@"已识别：%@ · 请选分组", chatId], NO);
-        [self presentPickerSetDefault:YES];
+        @try { [self presentPickerSetDefault:YES]; }
+        @catch (NSException *e) {
+            NSString *dig = PJQGDumpException(e);
+            @try { UIPasteboard.generalPasteboard.string = dig; } @catch (NSException *x) { }
+            PJQGAlert(@"分组出现异常", [NSString stringWithFormat:@"阶段：%@\n原因：%@\n\n已复制到剪贴板。",
+                                      gPJQGStage, e.reason ?: e.name ?: @"未知"], dig);
+        }
         return;
     }
 
+    PJQGSTAGE(@"写入分组");
     PJQGHUD([NSString stringWithFormat:@"%@ → 归入「%@」", chatId, PJQGKindName((PJQGKind)d)], NO);
-    [self applyChatId:chatId kind:(PJQGKind)d setDefault:NO];
+    @try { [self applyChatId:chatId kind:(PJQGKind)d setDefault:NO]; }
+    @catch (NSException *e) {
+        NSString *dig = PJQGDumpException(e);
+        PJQGHUD([NSString stringWithFormat:@"写入出错（阶段：%@）", gPJQGStage], NO);
+        @try { UIPasteboard.generalPasteboard.string = dig; } @catch (NSException *x) { }
+        PJQGAlert(@"分组出现异常", [NSString stringWithFormat:@"阶段：%@\n原因：%@\n\n已复制到剪贴板。",
+                                  gPJQGStage, e.reason ?: e.name ?: @"未知"], dig);
+    }
 }
 
 - (void)onDiagTap:(UIButton *)sender {
@@ -2468,7 +2627,13 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
 
     PJQGHUD(@"正在写入分组…", YES);
     NSString *detail = nil;
-    PJQGApplyResult r = PJQGApply(chatId, kind, &detail);
+    PJQGApplyResult r = PJQGApplyNoProvider;
+    PJQGSTAGE(@"写入:入口");
+    @try { r = PJQGApply(chatId, kind, &detail); }
+    @catch (NSException *e) {
+        detail = [NSString stringWithFormat:@"%@（阶段 %@）", e.reason ?: e.name ?: @"?", gPJQGStage];
+        r = PJQGApplyException;
+    }
     if (r == PJQGApplyOK) {
         NSString *ok = [NSString stringWithFormat:@"✅ 已归入：%@%@",
                         PJQGKindName(kind), setDefault ? @"（并设为默认）" : @""];
@@ -2627,6 +2792,7 @@ static void PJQGRequestManualChatId(UIViewController *from, void (^done)(NSStrin
         [s appendFormat:@"默认分组  : %@\n",
             PJQGDefaultKind() < 0 ? @"(未设置)" : PJQGKindName((PJQGKind)PJQGDefaultKind())];
         [s appendFormat:@"日志文件  : %@\n", PJQGLogPath()];
+        [s appendFormat:@"当前阶段  : %@\n", gPJQGStage ?: @"-"];
 
         [s appendString:@"\n--- 环境 ---\n"];
         [s appendFormat:@"聊天窗口类: %@\n", vc ? NSStringFromClass([vc class]) : @"(host 为空)"];
@@ -2835,6 +3001,83 @@ static void PJQGHookSetter(id self, SEL _cmd, id arg) {
     if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, arg);
 }
 
+// ★ v1.7：通用 setter 捕获（解决「动态捕获一直是 (无)」）
+//   旧做法只挂了 11 个写死的选择子（setM_nsChatName: / setChatUserName: …），
+//   微信 8.0.65 的 BaseMsgContentViewController 上可能一个都不存在 —— 这就是动态捕获一直为空的原因。
+//   现在：把聊天窗口类（含父类链，止于 UIViewController）所有「参数为对象」的 setter 全挂上，
+//   但只有在「值本身长得就像会话 ID（wxid_ / @chatroom / gh_ / @openim）」时才记录，
+//   避免把 setTitle: 之类的普通字符串当成会话 ID 污染识别结果。
+static void PJQGHookSetterStrict(id self, SEL _cmd, id arg) {
+    @try {
+        NSString *cid = nil;
+        NSString *src = nil;
+        if ([arg isKindOfClass:NSString.class]) {
+            NSString *s = (NSString *)arg;
+            if (s.length >= 6 && s.length <= 128 && PJQGLooksLikeChatIdScore(s) >= 15) {
+                cid = s;
+                src = NSStringFromSelector(_cmd);
+            }
+        } else if (arg) {
+            NSString *u = PJQGUsrNameFromObject(arg);
+            if (u.length && PJQGLooksLikeChatIdScore(u) >= 15) {
+                cid = u;
+                src = [NSString stringWithFormat:@"%@ → 对象成员", NSStringFromSelector(_cmd)];
+            }
+        }
+        if (cid.length > 0) PJQGRememberCapturedChatId(self, cid, src);
+    } @catch (NSException *e) { }
+
+    IMP orig = PJQGOrigIMPFor(self, _cmd);
+    if (orig) ((void (*)(id, SEL, id))orig)(self, _cmd, arg);
+}
+
+static void PJQGHookSettersGeneric(Class cls) {
+    @try {
+        if (!cls || !gPJQGMSHook) return;
+        if (!gPJQGHookTable) gPJQGHookTable = [NSMutableDictionary dictionary];
+
+        Class stopA = [UIViewController class];
+        Class stopB = [UIResponder class];
+        int guard = 0, hooked = 0;
+        for (Class k = cls; k && k != Nil && guard++ < 10; k = class_getSuperclass(k)) {
+            if (k == stopA || k == stopB || k == [NSObject class]) break;
+            unsigned cnt = 0;
+            Method *ms = class_copyMethodList(k, &cnt);
+            if (!ms) continue;
+            for (unsigned i = 0; i < cnt; i++) {
+                SEL s = method_getName(ms[i]);
+                const char *sn = sel_getName(s);
+                if (!sn || strncmp(sn, "set", 3) != 0) continue;
+                if (strlen(sn) < 5) continue;
+                char c4 = sn[3];
+                if (!(c4 >= 'A' && c4 <= 'Z')) continue;
+                if (method_getNumberOfArguments(ms[i]) != 3) continue;
+                char t[16] = {0};
+                method_getArgumentType(ms[i], 2, t, sizeof(t));
+                if (t[0] != '@') continue;
+                if (t[1] == '?' || t[1] == '#') continue;    // 跳过 block / Class 参数
+                NSString *key = [NSString stringWithFormat:@"%s|%s", class_getName(k), sn];
+                if (gPJQGHookTable[key]) continue;
+                @try {
+                    IMP orig = NULL;
+                    gPJQGMSHook(k, s, (IMP)PJQGHookSetterStrict, &orig);
+                    if (orig) {
+                        gPJQGHookTable[key] = [NSNumber numberWithUnsignedLongLong:(unsigned long long)(uintptr_t)orig];
+                        hooked++;
+                    }
+                } @catch (NSException *e) { }
+                if (hooked >= 160) break;
+            }
+            free(ms);
+            if (hooked >= 160) break;
+        }
+        if (hooked) PJQGLog(@"[hook] 通用 setter 捕获 %s: 新挂 %d 个（表内共 %lu）",
+                            class_getName(cls), hooked, (unsigned long)gPJQGHookTable.count);
+    } @catch (NSException *e) {
+        PJQGLog(@"[hook] 通用 setter 捕获异常: %@", e.reason);
+    }
+}
+
 static void PJQGHookSetters(Class cls) {
     if (!cls) return;
     if (!gPJQGHookProbed) {
@@ -2874,6 +3117,9 @@ static void PJQGHookSetters(Class cls) {
             }
         }
     }
+
+    // v1.7：再挂一遍「通用 setter 捕获」（只在值像会话 ID 时才记录）
+    PJQGHookSettersGeneric(cls);
 }
 
 #pragma mark - 载入自证
@@ -2907,7 +3153,7 @@ static void PJQGHookSettersEarly(void) {
                 [targets componentsJoinedByString:@", "]);
         for (NSString *cn in targets) {
             Class c = NSClassFromString(cn);
-            if (c) PJQGHookSetters(c);
+            if (c) { PJQGHookSetters(c); PJQGHookSettersGeneric(c); }
         }
     } @catch (NSException *e) {
         PJQGLog(@"[hook] 早期挂钩失败: %@", e.reason);
